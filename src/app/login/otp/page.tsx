@@ -1,0 +1,140 @@
+import { MailCheck } from "lucide-react";
+import { redirect } from "next/navigation";
+
+import { AuthShell } from "@/components/auth-shell";
+import {
+  getDefaultRouteForRole,
+  getPendingAuthProfile,
+  getSessionProfile,
+} from "@/lib/auth";
+import { getEmailOtpLifetimeMinutes } from "@/lib/email-otp";
+
+type SearchParams = Promise<Record<string, string | string[] | undefined>>;
+
+const otpMessages = {
+  "invalid-token": "Enter the latest email OTP exactly as it was sent.",
+  "otp-sent": "A new verification code has been sent to your email.",
+  "otp-delivery-failed": "RAPID could not send the email verification code.",
+} as const;
+
+function resolveQueryValue(value: string | string[] | undefined) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+export default async function EmailOtpPage({
+  searchParams,
+}: {
+  searchParams: SearchParams;
+}) {
+  const pendingAuth = await getPendingAuthProfile();
+  const session = await getSessionProfile();
+
+  if (!pendingAuth && session) {
+    redirect(getDefaultRouteForRole(session.role));
+  }
+
+  if (!pendingAuth) {
+    redirect("/login");
+  }
+
+  if (!pendingAuth.user.pendingEmailOtpPurpose) {
+    redirect("/login/totp");
+  }
+
+  const query = await searchParams;
+  const mode = resolveQueryValue(query.mode) ?? pendingAuth.user.pendingEmailOtpPurpose;
+  const statusKey = resolveQueryValue(query.status) ?? resolveQueryValue(query.error);
+  const detail = resolveQueryValue(query.detail);
+  const feedback = statusKey
+    ? otpMessages[statusKey as keyof typeof otpMessages]
+    : null;
+  const isTotpReset = mode === "totp-reset";
+  const isAccountRecovery = mode === "account-recovery";
+
+  return (
+    <AuthShell
+      eyebrow="Email verification"
+      title={
+        isTotpReset
+          ? "Confirm your authenticator reset."
+          : isAccountRecovery
+            ? "Confirm your account recovery request."
+            : "Enter your email OTP."
+      }
+      description={
+        isTotpReset
+          ? "Before RAPID resets Microsoft Authenticator, we'll verify this request with an email OTP."
+          : isAccountRecovery
+            ? "Before RAPID resets your password and authenticator, we'll verify the request with an email OTP."
+            : "Before RAPID enables your account, we'll verify your email with a one-time password."
+      }
+      panel={
+        <article className="auth-panel-card px-6 py-6">
+          <div className="flex items-center gap-3">
+            <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-950 text-white">
+              <MailCheck className="h-4 w-4" />
+            </span>
+            <div>
+              <p className="text-sm font-semibold text-slate-950">Verification email sent</p>
+              <p className="text-sm text-slate-600">
+                Code sent to {pendingAuth.user.email}. It expires in {getEmailOtpLifetimeMinutes()} minutes.
+              </p>
+            </div>
+          </div>
+        </article>
+      }
+    >
+      {feedback ? (
+        <div
+          className={`rounded-[24px] border px-5 py-4 text-sm ${
+            statusKey === "otp-sent"
+              ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+              : "border-rose-200 bg-rose-50 text-rose-800"
+          }`}
+        >
+          {feedback}
+          {detail ? ` ${decodeURIComponent(detail)}` : ""}
+        </div>
+      ) : null}
+
+      <form action="/api/auth/verify-email-otp" method="post" className="mt-6 space-y-5" autoComplete="off">
+        <input
+          type="hidden"
+          name="mode"
+          value={isTotpReset ? "totp-reset" : isAccountRecovery ? "account-recovery" : "onboarding"}
+        />
+        <div>
+          <label className="block text-sm font-semibold text-slate-700" htmlFor="token">
+            Email OTP
+          </label>
+          <input
+            id="token"
+            name="token"
+            type="password"
+            inputMode="numeric"
+            pattern="[0-9]{6}"
+            maxLength={6}
+            required
+            className="auth-input text-center text-2xl tracking-[0.35em]"
+          />
+        </div>
+
+        <button type="submit" className="auth-button-primary w-full">
+          Verify OTP
+        </button>
+      </form>
+
+      <form action="/api/auth/resend-email-otp" method="post" className="mt-4">
+        <button type="submit" className="auth-button-secondary w-full">
+          Resend OTP
+        </button>
+      </form>
+
+      <form action="/api/auth/cancel-pending" method="post" className="mt-4">
+        <button type="submit" className="auth-button-secondary w-full">
+          Cancel
+        </button>
+      </form>
+    </AuthShell>
+  );
+}

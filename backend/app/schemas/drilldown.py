@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class DrillDownAggregation(BaseModel):
+    type: Literal["sum", "count", "avg", "min", "max"] = "sum"
+    field: str = Field(min_length=1)
+
+
+class DrillDownDateRange(BaseModel):
+    start: str | None = None
+    end: str | None = None
+
+
+class DrillDownContext(BaseModel):
+    source: Literal[
+        "actuals",
+        "budget",
+        "forecast",
+        "variance",
+        "combined",
+        "kiosk_unified",
+        "dashboard",
+    ]
+    metric: str = Field(min_length=1)
+    value: float | None = None
+    filters: dict[str, Any] = Field(default_factory=dict)
+    group_by: list[str] = Field(default_factory=list, alias="groupBy")
+    date_range: DrillDownDateRange | None = Field(default=None, alias="dateRange")
+    month: str | None = None
+    fiscal_year: str | None = Field(default=None, alias="fiscalYear")
+    display_title: str | None = Field(default=None, alias="displayTitle")
+    columns: list[str] = Field(default_factory=list)
+    aggregation: DrillDownAggregation | None = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=100, ge=1, le=1000, alias="pageSize")
+    search: str | None = None
+    sort_by: str | None = Field(default=None, alias="sortBy")
+    sort_dir: Literal["asc", "desc"] = Field(default="desc", alias="sortDir")
+    dataset: str | None = None
+    strict_metric_scope: bool | None = Field(default=None, alias="strictMetricScope")
+
+
+class DrillDownExportRequest(BaseModel):
+    context: DrillDownContext
+    format: Literal["csv", "xlsx"] = "csv"

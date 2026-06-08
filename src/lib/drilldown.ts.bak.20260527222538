@@ -1,0 +1,124 @@
+export type DrillDownSource =
+  | "actuals"
+  | "budget"
+  | "forecast"
+  | "variance"
+  | "combined"
+  | "dashboard";
+
+export type DrillDownAggregationType = "sum" | "count" | "avg" | "min" | "max";
+
+export type DrillDownContext = {
+  source: DrillDownSource;
+  metric: string;
+  value?: number;
+  filters?: Record<string, unknown>;
+  groupBy?: string[];
+  dateRange?: {
+    start?: string;
+    end?: string;
+  };
+  month?: string;
+  fiscalYear?: string;
+  displayTitle?: string;
+  columns?: string[];
+  aggregation?: {
+    type: DrillDownAggregationType;
+    field: string;
+  };
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  sortBy?: string;
+  sortDir?: "asc" | "desc";
+  dataset?: string;
+};
+
+export type DrillDownDetailsResponse = {
+  title: string;
+  filters: Record<string, unknown>;
+  summary: {
+    record_count: number;
+    total_value: number;
+    clicked_value: number | null;
+    difference: number;
+    is_reconciled: boolean;
+  };
+  columns: Array<{
+    key: string;
+    label: string;
+  }>;
+  rows: Array<Record<string, unknown>>;
+  pagination: {
+    page: number;
+    page_size: number;
+    total_rows: number;
+  };
+  context: {
+    source: string;
+    metric: string;
+    aggregation: Record<string, unknown>;
+  };
+};
+
+async function postJson<T>(path: string, payload: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? "Request failed.");
+  }
+  return (await response.json()) as T;
+}
+
+export function mergeDrillDownFilters(
+  ...filterSets: Array<Record<string, unknown> | undefined | null>
+) {
+  const merged: Record<string, unknown> = {};
+  for (const filterSet of filterSets) {
+    if (!filterSet) {
+      continue;
+    }
+    for (const [key, value] of Object.entries(filterSet)) {
+      if (value === undefined || value === null || value === "") {
+        continue;
+      }
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+export async function fetchDrillDownDetails(context: DrillDownContext) {
+  return postJson<DrillDownDetailsResponse>("/api/drilldown/details", context);
+}
+
+export async function exportDrillDownDetails(
+  context: DrillDownContext,
+  format: "csv" | "xlsx" = "csv",
+) {
+  const response = await fetch("/api/drilldown/export", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ context, format }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? "Unable to export details.");
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename=\"?([^\";]+)\"?/i.exec(disposition);
+  const filename = match?.[1] ?? `drilldown.${format}`;
+  return { blob, filename };
+}
+

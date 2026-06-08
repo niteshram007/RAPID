@@ -1,0 +1,4981 @@
+from __future__ import annotations
+
+import copy
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+
+import duckdb
+import pandas as pd
+
+from .financial_dataset import FIELD_SPECS, MONTH_SEQUENCE
+from .masterdata_store import ensure_budget_sync_to_rapid_revenue
+from .postgres import ensure_postgres_schema, get_database_status, open_database_connection
+from .services.global_revenue_processing_service import refresh_actual_revenue
+
+LOGGER = logging.getLogger(__name__)
+
+MONTH_LABELS = [label for label, *_ in MONTH_SEQUENCE]
+MONTH_INDEX = {label: index for index, label in enumerate(MONTH_LABELS)}
+MONTH_TO_QUARTER = {
+    "Apr": "Q1",
+    "May": "Q1",
+    "Jun": "Q1",
+    "Jul": "Q2",
+    "Aug": "Q2",
+    "Sep": "Q2",
+    "Oct": "Q3",
+    "Nov": "Q3",
+    "Dec": "Q3",
+    "Jan": "Q4",
+    "Feb": "Q4",
+    "Mar": "Q4",
+}
+US_GEOGRAPHY_ALIASES = {
+    "US",
+    "USA",
+    "USN",
+    "USW",
+    "USE",
+    "USS",
+    "USC",
+    "US-CENTRAL",
+    "US-EAST",
+    "US-WEST",
+    "US-SOUTH",
+    "NORTH AMERICA",
+    "UNITED STATES",
+    "UNITED STATES OF AMERICA",
+}
+ROW_GEOGRAPHY_ALIASES = {
+    "ROW",
+    "REST OF WORLD",
+    "REST-OF-WORLD",
+}
+NUMERIC_FIELD_KEYS = tuple(field.key for field in FIELD_SPECS if field.kind == "numeric")
+DATE_FIELD_KEYS = tuple(field.key for field in FIELD_SPECS if field.kind == "date")
+TEXT_FIELD_KEYS = tuple(field.key for field in FIELD_SPECS if field.kind == "text")
+
+PRIMARY_DIMENSION_LABELS = {
+    "region": "Geography",
+    "practice_head": "Practice",
+    "bdm": "BDM",
+    "customer_name": "Account",
+}
+LEGACY_TO_ARRAY_FILTER_MAP = {
+    "financialYear": "financialYears",
+    "region": "geographies",
+    "practiceHead": "practices",
+    "geoHead": "geoHeads",
+    "entity": "entities",
+    "vertical": "verticals",
+    "customerName": "accounts",
+    "dealType": "dealTypes",
+    "businessType": "businessTypes",
+}
+OVERVIEW_FORECAST_MONTH_COLUMNS = {
+    "Apr": "apr_2026",
+    "May": "may_2026",
+    "Jun": "jun_2026",
+    "Jul": "jul_2026",
+    "Aug": "aug_2026",
+    "Sep": "sep_2026",
+    "Oct": "oct_2026",
+    "Nov": "nov_2026",
+    "Dec": "dec_2026",
+    "Jan": "jan_2027",
+    "Feb": "feb_2027",
+    "Mar": "mar_2027",
+}
+OVERVIEW_FORECAST_DIMENSION_COLUMNS = (
+    "customer_name",
+    "group_company",
+    "project_name",
+    "resource_name",
+    "ms_ps",
+    "region",
+    "practice_head",
+    "geo_head",
+    "bdm",
+    "entity",
+    "vertical",
+    "deal_type",
+    "business_type",
+    "strategic_account",
+    "eeennn",
+    "ocn_number",
+    "resource_id",
+    "client_name",
+)
+OVERVIEW_MAPPING_FILL_COLUMNS = (
+    "group_company",
+    "vertical",
+    "region",
+    "practice_head",
+    "geo_head",
+    "bdm",
+    "entity",
+    "deal_type",
+    "strategic_account",
+    "eeennn",
+)
+# Keep budget-owned ROW/US and Vertical values from the budget file. Overwriting
+# them with actual identifiers makes kiosk budget splits drift from the upload.
+OVERVIEW_IDENTIFIER_OVERWRITE_COLUMNS = (
+    "practice_head",
+    "geo_head",
+    "bdm",
+    "entity",
+)
+OVERVIEW_IDENTIFIER_FILL_ONLY_COLUMNS = (
+    "deal_type",
+    "strategic_account",
+    "eeennn",
+)
+CUSTOMER_ALIAS_STOP_WORDS = {
+    "the",
+    "and",
+    "india",
+    "private",
+    "pvt",
+    "limited",
+    "ltd",
+    "inc",
+    "incorporated",
+    "corporation",
+    "corp",
+    "llc",
+    "gmbh",
+    "sa",
+    "srl",
+    "plc",
+    "bv",
+    "pte",
+    "company",
+    "co",
+}
+ANALYTICS_CACHE_TTL_SECONDS = max(
+    float(os.getenv("RAPID_ANALYTICS_CACHE_TTL_SECONDS", "300")),
+    0.0,
+)
+ACTUAL_REFRESH_CHECK_TTL_SECONDS = max(
+    float(os.getenv("RAPID_ACTUAL_REFRESH_CHECK_TTL_SECONDS", "60")),
+    1.0,
+)
+MAX_ANALYTICS_CACHE_ENTRIES = max(
+    int(os.getenv("RAPID_ANALYTICS_CACHE_MAX_ENTRIES", "256")),
+    32,
+)
+_OVERVIEW_PAYLOAD_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_COMPARISON_PAYLOAD_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_BUDGET_KIOSK_PAYLOAD_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_ACTUAL_REFRESH_CHECK_STATE: dict[str, tuple[str, float]] = {}
+
+
+@dataclass
+class DashboardFilters:
+    financial_years: list[str]
+    geographies: list[str]
+    practices: list[str]
+    geo_heads: list[str]
+    bdms: list[str]
+    entities: list[str]
+    verticals: list[str]
+    accounts: list[str]
+    projects: list[str]
+    strategic_accounts: list[str]
+    deal_types: list[str]
+    business_types: list[str]
+    eeennns: list[str]
+    period_from: str
+    period_to: str
+    comparison_mode: str
+    comparison_metric: str
+    comparison_period: str
+    compare_previous: bool
+    breakdown_dimension: str
+    what_if_pct: float
+
+
+def _filters_cache_key(normalized: DashboardFilters) -> tuple[Any, ...]:
+    return (
+        tuple(normalized.financial_years),
+        tuple(normalized.geographies),
+        tuple(normalized.practices),
+        tuple(normalized.geo_heads),
+        tuple(normalized.bdms),
+        tuple(normalized.entities),
+        tuple(normalized.verticals),
+        tuple(normalized.accounts),
+        tuple(normalized.projects),
+        tuple(normalized.strategic_accounts),
+        tuple(normalized.deal_types),
+        tuple(normalized.business_types),
+        tuple(normalized.eeennns),
+        normalized.period_from,
+        normalized.period_to,
+        normalized.comparison_mode,
+        normalized.comparison_metric,
+        normalized.comparison_period,
+        normalized.compare_previous,
+        normalized.breakdown_dimension,
+        round(normalized.what_if_pct, 4),
+    )
+
+
+def _resolve_workspace_data_version(connection: Any, financial_year: str) -> tuple[str, ...]:
+    if not financial_year:
+        return ("no-year",)
+
+    query = """
+        with version_parts as (
+            select
+                'budget' as source,
+                coalesce(
+                    string_agg(
+                        id::text || ':' ||
+                        coalesce(imported_rows::text, '') || ':' ||
+                        coalesce(uploaded_at::text, ''),
+                        ','
+                        order by uploaded_at desc nulls last, id::text
+                    ),
+                    ''
+                ) as version
+            from budget_uploads
+            where financial_year = %s
+              and is_active = true
+            union all
+            select
+                'actual' as source,
+                coalesce(
+                    string_agg(
+                        id::text || ':' ||
+                        coalesce(imported_rows::text, '') || ':' ||
+                        coalesce(uploaded_at::text, ''),
+                        ','
+                        order by uploaded_at desc nulls last, id::text
+                    ),
+                    ''
+                ) as version
+            from global_revenue_uploads
+            where financial_year = %s
+              and is_active = true
+            union all
+            select
+                'forecast-upload' as source,
+                coalesce(
+                    string_agg(
+                        id::text || ':' ||
+                        coalesce(imported_rows::text, '') || ':' ||
+                        coalesce(uploaded_at::text, ''),
+                        ','
+                        order by uploaded_at desc nulls last, id::text
+                    ),
+                    ''
+                ) as version
+            from forecast_uploads
+            where financial_year = %s
+              and is_active = true
+            union all
+            select
+                'rapid-revenue' as source,
+                coalesce(
+                    string_agg(
+                        id::text || ':' ||
+                        coalesce(imported_rows::text, '') || ':' ||
+                        coalesce(uploaded_at::text, ''),
+                        ','
+                        order by uploaded_at desc nulls last, id::text
+                    ),
+                    ''
+                ) as version
+            from rapid_revenue_uploads
+            where financial_year = %s
+              and is_active = true
+            union all
+            select
+                'forecast-entry' as source,
+                count(*)::text || ':' || coalesce(max(submitted_at)::text, '') as version
+            from rapid_forecast_entries
+            where financial_year = %s
+        )
+        select source, version
+        from version_parts
+        order by source
+    """
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                (
+                    financial_year,
+                    financial_year,
+                    financial_year,
+                    financial_year,
+                    financial_year,
+                ),
+            )
+            rows = cursor.fetchall()
+    except Exception:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        LOGGER.exception("Unable to resolve workspace data version for analytics cache")
+        return ("version-error", financial_year)
+
+    return tuple(
+        f"{row.get('source') or ''}={row.get('version') or ''}"
+        for row in rows
+    ) or ("empty-version", financial_year)
+
+
+def _read_cached_payload(
+    cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]],
+    key: tuple[Any, ...],
+) -> dict[str, Any] | None:
+    if ANALYTICS_CACHE_TTL_SECONDS <= 0:
+        return None
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    expires_at, payload = entry
+    if expires_at <= time.monotonic():
+        cache.pop(key, None)
+        return None
+    return copy.deepcopy(payload)
+
+
+def _write_cached_payload(
+    cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]],
+    key: tuple[Any, ...],
+    payload: dict[str, Any],
+) -> None:
+    if ANALYTICS_CACHE_TTL_SECONDS <= 0:
+        return
+    now = time.monotonic()
+    expires_at = now + ANALYTICS_CACHE_TTL_SECONDS
+    cache[key] = (expires_at, copy.deepcopy(payload))
+    if len(cache) <= MAX_ANALYTICS_CACHE_ENTRIES:
+        return
+
+    expired_keys = [cache_key for cache_key, (expiry, _) in cache.items() if expiry <= now]
+    for cache_key in expired_keys:
+        cache.pop(cache_key, None)
+    while len(cache) > MAX_ANALYTICS_CACHE_ENTRIES:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
+
+
+def _read_latest_cached_payload(
+    cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]],
+) -> dict[str, Any] | None:
+    if ANALYTICS_CACHE_TTL_SECONDS <= 0 or not cache:
+        return None
+    now = time.monotonic()
+    freshest_key: tuple[Any, ...] | None = None
+    freshest_expiry = -1.0
+    for key, (expiry, _) in list(cache.items()):
+        if expiry <= now:
+            cache.pop(key, None)
+            continue
+        if expiry > freshest_expiry:
+            freshest_key = key
+            freshest_expiry = expiry
+    if freshest_key is None:
+        return None
+    payload = cache.get(freshest_key)
+    return copy.deepcopy(payload[1]) if payload else None
+
+
+def build_revenue_dashboard_payload(filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    database_status = get_database_status()
+
+    try:
+        ensure_postgres_schema()
+        with open_database_connection(require=False) as connection:
+            if connection is None:
+                return _empty_dashboard(
+                    _normalize_filters(filters, default_year=""),
+                    database_status,
+                )
+
+            records_df, uploads_df = _load_active_frames(connection)
+    except Exception:
+        LOGGER.exception("Revenue dashboard payload fallback triggered due to data access failure")
+        return _empty_dashboard(
+            _normalize_filters(filters, default_year=""),
+            database_status,
+        )
+
+    if uploads_df.empty:
+        normalized = _normalize_filters(filters, default_year="")
+        return _empty_dashboard(normalized, database_status)
+
+    default_year = str(uploads_df.iloc[0]["financial_year"])
+    normalized = _normalize_filters(filters, default_year=default_year)
+    base_df = records_df.copy()
+    for optional_column in OVERVIEW_FORECAST_DIMENSION_COLUMNS:
+        if optional_column not in base_df.columns:
+            base_df[optional_column] = ""
+
+    if normalized.financial_years:
+        base_df = base_df[base_df["financial_year"].isin(normalized.financial_years)]
+
+    latest_upload_row = _select_latest_upload(uploads_df, normalized.financial_years)
+    filter_options = _build_filter_options(base_df, normalized)
+    filtered_df = _apply_filters(base_df, normalized)
+
+    if filtered_df.empty:
+        return _empty_dashboard(
+            normalized,
+            database_status,
+            filter_options=filter_options,
+            dataset=_serialize_dataset(latest_upload_row, normalized.financial_years),
+        )
+
+    monthly_df = _build_monthly_frame(filtered_df)
+    monthly_df = _filter_month_window(monthly_df, normalized.period_from, normalized.period_to)
+    duck = duckdb.connect(database=":memory:")
+
+    try:
+        duck.register("records", filtered_df)
+        duck.register("monthly", monthly_df)
+
+        summary = _build_summary(duck)
+        trend_series = _build_trend_series(duck, normalized)
+        variance_bars = _build_variance_bars(trend_series)
+        contribution = _build_contribution(duck, normalized)
+        heatmap = _build_heatmap(duck, normalized)
+        performers = _build_performers(duck, normalized)
+        resource_table = _build_resource_table(duck)
+        top_customers = _build_breakdown(duck, "customer_name")
+        top_regions = _build_breakdown(duck, "region")
+        comparison = _build_comparison_summary(
+            all_records_df=records_df,
+            filtered_records_df=filtered_df,
+            uploads_df=uploads_df,
+            normalized=normalized,
+            current_monthly_df=monthly_df,
+        )
+        waterfall = _build_waterfall(duck, summary, normalized)
+        side_by_side = _build_side_by_side(filtered_df, normalized)
+        insights = _build_insights(
+            summary=summary,
+            trend_series=trend_series,
+            contribution=contribution["rows"],
+            comparison=comparison,
+            performers=performers["rows"],
+        )
+    finally:
+        duck.close()
+
+    dataset = _serialize_dataset(latest_upload_row, normalized.financial_years)
+    highlights = [insight["headline"] for insight in insights[:4]]
+    selected_filters = _serialize_selected_filters(normalized)
+
+    return {
+        "database": database_status,
+        "selectedFilters": selected_filters,
+        "filters": filter_options,
+        "summary": summary,
+        "monthlySeries": trend_series,
+        "topCustomers": top_customers,
+        "topRegions": top_regions,
+        "resourceTable": resource_table,
+        "dataset": dataset,
+        "highlights": highlights,
+        "comparison": comparison,
+        "trend": {
+            "rows": trend_series,
+            "metric": normalized.comparison_metric,
+            "fromPeriod": normalized.period_from,
+            "toPeriod": normalized.period_to,
+            "whatIfPct": normalized.what_if_pct,
+        },
+        "variance": {
+            "mode": normalized.comparison_mode,
+            "rows": variance_bars,
+        },
+        "contribution": contribution,
+        "heatmap": heatmap,
+        "performers": performers,
+        "waterfall": waterfall,
+        "insights": insights,
+        "sideBySide": side_by_side,
+        "exports": {
+            "csvRows": len(resource_table),
+            "pngReady": True,
+        },
+        "nlq": {
+            "supportedExamples": [
+                "Show APAC last quarter",
+                "Compare BDM Anil with BDM Ravi",
+                "Show forecast variance for North America",
+            ]
+        },
+    }
+
+
+def build_revenue_overview_payload(filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    database_status = get_database_status()
+    normalized = _normalize_filters(filters, default_year="")
+    selected_year = normalized.financial_years[0] if normalized.financial_years else ""
+
+    if not selected_year:
+        return _empty_overview_payload(normalized, database_status)
+
+    cache_key: tuple[Any, ...] | None = None
+
+    try:
+        ensure_postgres_schema()
+        with open_database_connection(require=False) as connection:
+            if connection is None:
+                return _empty_overview_payload(normalized, database_status)
+
+            data_version = _resolve_workspace_data_version(connection, selected_year)
+            cache_key = ("overview", data_version, *_filters_cache_key(normalized))
+            cached_payload = _read_cached_payload(_OVERVIEW_PAYLOAD_CACHE, cache_key)
+            if cached_payload is not None:
+                return cached_payload
+
+            has_budget_upload = _has_active_budget_upload(connection, selected_year)
+            has_actual_upload = _has_active_actual_upload(connection, selected_year)
+            if not has_budget_upload and not has_actual_upload:
+                return _empty_overview_payload(normalized, database_status)
+
+            if has_budget_upload and not _has_budget_data_for_year(connection, selected_year):
+                ensure_budget_sync_to_rapid_revenue(
+                    financial_year=selected_year,
+                    connection=connection,
+                )
+                connection.commit()
+            if has_actual_upload:
+                _ensure_actual_revenue_for_year(connection, selected_year)
+            budget_df = _load_budget_overview_frame(connection, selected_year)
+            actual_df = _load_actual_overview_frame(connection, selected_year)
+            forecast_submission_df = _load_forecast_submission_overview_frame(connection, selected_year)
+            forecast_upload_df = _load_forecast_overview_frame(connection, selected_year)
+            forecast_df = _build_effective_forecast_overview_frame(
+                forecast_upload_df,
+                forecast_submission_df,
+            )
+    except Exception:
+        LOGGER.exception("Revenue overview payload fallback triggered due to data access failure")
+        fallback_cached = _read_latest_cached_payload(_OVERVIEW_PAYLOAD_CACHE)
+        if fallback_cached is not None:
+            return fallback_cached
+        return _empty_overview_payload(normalized, database_status)
+
+    budget_df = _normalize_overview_frame(budget_df) if not budget_df.empty else budget_df
+    forecast_df = _normalize_overview_frame(forecast_df) if not forecast_df.empty else forecast_df
+    actual_df = _normalize_overview_frame(
+        actual_df,
+        infer_ms_ps_from_identifiers=False,
+    ) if not actual_df.empty else actual_df
+
+    budget_df = _apply_filters(budget_df, normalized) if not budget_df.empty else budget_df
+    actual_df = _apply_filters(actual_df, normalized) if not actual_df.empty else actual_df
+    forecast_df = _apply_filters(forecast_df, normalized) if not forecast_df.empty else forecast_df
+    if forecast_df.empty and not budget_df.empty:
+        forecast_df = budget_df.copy()
+
+    monthly_series = _build_overview_monthly_series(
+        budget_df=budget_df,
+        actual_df=actual_df,
+        forecast_df=forecast_df,
+    )
+    summary = _build_overview_summary(
+        budget_df=budget_df,
+        actual_df=actual_df,
+        forecast_df=forecast_df,
+        monthly_series=monthly_series,
+    )
+
+    payload = {
+        "database": database_status,
+        "summary": summary,
+        "monthlySeries": monthly_series,
+        "dataset": {
+            "uploadId": None,
+            "financialYear": selected_year,
+            "originalFilename": None,
+            "uploadedAt": None,
+            "importedRows": int(summary["rowCount"]),
+            "parsedSheets": [],
+        },
+    }
+    if cache_key is not None:
+        _write_cached_payload(_OVERVIEW_PAYLOAD_CACHE, cache_key, payload)
+    return payload
+
+
+def build_revenue_monthly_comparison_payload(filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    database_status = get_database_status()
+    normalized = _normalize_filters(filters, default_year="")
+    selected_year = normalized.financial_years[0] if normalized.financial_years else ""
+    fallback_month = normalized.period_to if normalized.period_to in MONTH_LABELS else "Mar"
+    cache_key: tuple[Any, ...] | None = None
+    data_version: str | None = None
+
+    try:
+        ensure_postgres_schema()
+        with open_database_connection(require=False) as connection:
+            if connection is None:
+                if not selected_year:
+                    return _empty_monthly_comparison_payload("", fallback_month, database_status)
+                return _empty_monthly_comparison_payload(selected_year, fallback_month, database_status)
+
+            if not selected_year:
+                selected_year = _resolve_latest_workspace_financial_year(connection)
+                if not selected_year:
+                    return _empty_monthly_comparison_payload("", fallback_month, database_status)
+                normalized.financial_years = [selected_year]
+
+            data_version = _resolve_workspace_data_version(connection, selected_year)
+            cache_key = ("comparison", data_version, *_filters_cache_key(normalized))
+            cached_payload = _read_cached_payload(_COMPARISON_PAYLOAD_CACHE, cache_key)
+            if cached_payload is not None:
+                return cached_payload
+
+            has_budget_upload = _has_active_budget_upload(connection, selected_year)
+            has_actual_upload = _has_active_actual_upload(connection, selected_year)
+            if not has_budget_upload and not has_actual_upload:
+                return _empty_monthly_comparison_payload(selected_year, fallback_month, database_status)
+
+            if has_budget_upload and not _has_budget_data_for_year(connection, selected_year):
+                ensure_budget_sync_to_rapid_revenue(
+                    financial_year=selected_year,
+                    connection=connection,
+                )
+                connection.commit()
+            if has_actual_upload:
+                _ensure_actual_revenue_for_year(connection, selected_year)
+            budget_df = _load_budget_overview_frame(connection, selected_year)
+            actual_df = _load_actual_overview_frame(connection, selected_year)
+            forecast_submission_df = _load_forecast_submission_overview_frame(connection, selected_year)
+            forecast_upload_df = _load_forecast_overview_frame(connection, selected_year)
+            forecast_df = _build_effective_forecast_overview_frame(
+                forecast_upload_df,
+                forecast_submission_df,
+            )
+    except Exception:
+        LOGGER.exception("Revenue monthly comparison payload fallback triggered due to data access failure")
+        fallback_cached = _read_latest_cached_payload(_COMPARISON_PAYLOAD_CACHE)
+        if fallback_cached is not None:
+            return fallback_cached
+        return _empty_monthly_comparison_payload(selected_year, fallback_month, database_status)
+
+    budget_df = _normalize_overview_frame(budget_df) if not budget_df.empty else budget_df
+    forecast_df = _normalize_overview_frame(forecast_df) if not forecast_df.empty else forecast_df
+    actual_df = _normalize_overview_frame(
+        actual_df,
+        infer_ms_ps_from_identifiers=False,
+    ) if not actual_df.empty else actual_df
+    if not actual_df.empty and not budget_df.empty:
+        budget_identifier_lookup = _build_budget_identifier_lookup(budget_df)
+        actual_df = _apply_budget_group_company_to_actuals(
+            actual_df,
+            budget_identifier_lookup,
+        )
+
+    # Keep budget/forecast buckets as-authored in the uploaded workbook so
+    # analytical kiosk charts reflect source-of-truth Excel dimensions.
+    # Actual revenue values remain source-of-truth from the actuals upload.
+    # We align customer-facing dimensions with the budget reference key so
+    # budget Customer/Updated Customer and actual Updated Customer roll into
+    # the correct customer buckets without using the LLM for matching.
+    budget_df = _apply_filters(budget_df, normalized) if not budget_df.empty else budget_df
+    actual_df = _apply_filters(actual_df, normalized) if not actual_df.empty else actual_df
+    forecast_df = _apply_filters(forecast_df, normalized) if not forecast_df.empty else forecast_df
+    if forecast_df.empty and not budget_df.empty:
+        forecast_df = budget_df.copy()
+
+    comparison_months = _resolve_period_months(normalized.period_from, normalized.period_to)
+    if not comparison_months:
+        comparison_months = [fallback_month if fallback_month in MONTH_LABELS else "Mar"]
+    comparison_month = comparison_months[-1]
+    comparison_rows = _build_monthly_comparison_rows(
+        budget_df=budget_df,
+        forecast_df=forecast_df,
+        actual_df=actual_df,
+        months=comparison_months,
+    )
+    totals = {
+        "budget": float(sum(float(row.get("budget") or 0.0) for row in comparison_rows)),
+        "forecast": float(sum(float(row.get("forecast") or 0.0) for row in comparison_rows)),
+        "actual": float(sum(float(row.get("actual") or 0.0) for row in comparison_rows)),
+    }
+    totals["varianceVsBudget"] = float(totals["actual"] - totals["budget"])
+    totals["varianceVsForecast"] = float(totals["actual"] - totals["forecast"])
+
+    payload = {
+        "database": database_status,
+        "financialYear": selected_year,
+        "comparisonMonth": comparison_month,
+        "resolvedPeriod": {
+            "financialYear": selected_year,
+            "periodFrom": normalized.period_from,
+            "periodTo": normalized.period_to,
+            "comparisonMonth": comparison_month,
+        },
+        "dataVersion": str(data_version or ""),
+        "scopeMode": "actuals_source_of_truth",
+        "summary": {
+            "rowCount": int(len(comparison_rows)),
+            **totals,
+        },
+        "rows": comparison_rows,
+    }
+    if cache_key is not None:
+        _write_cached_payload(_COMPARISON_PAYLOAD_CACHE, cache_key, payload)
+    return payload
+
+
+def _load_budget_kiosk_frame(connection: Any, financial_year: str) -> pd.DataFrame:
+    query = """
+        select
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.customer_name), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'Updated Customer',
+                            r.raw_payload->>'Updated Customer Name',
+                            r.raw_payload->>'Customer Name',
+                            r.raw_payload->>'Customer'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as customer_name,
+            coalesce(
+                nullif(trim(r.gr_entity), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'GR Entity',
+                            r.raw_payload->>'Entity As per GR',
+                            r.raw_payload->>'Group company',
+                            r.raw_payload->>'Group Company'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as group_company,
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.customer_name), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer'), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer Name'), ''),
+                ''
+            ) as client_name,
+            coalesce(
+                nullif(trim(r.project_name), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Project Name', r.raw_payload->>'Project')), ''),
+                ''
+            ) as project_name,
+            coalesce(
+                nullif(trim(r.resource_name), ''),
+                nullif(trim(r.raw_payload->>'Resource Name'), ''),
+                ''
+            ) as resource_name,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as ms_ps,
+            coalesce(
+                nullif(trim(r.row_us), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'ROW/US',
+                            r.raw_payload->>'Region summary',
+                            r.raw_payload->>'Region Summary',
+                            r.raw_payload->>'Region'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as region,
+            coalesce(
+                nullif(trim(r.practice_head), ''),
+                nullif(trim(r.raw_payload->>'Practice Head'), ''),
+                ''
+            ) as practice_head,
+            coalesce(
+                nullif(trim(r.geo_head), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Geo Head', r.raw_payload->>'GeoHead', r.raw_payload->>'Geo head')), ''),
+                ''
+            ) as geo_head,
+            coalesce(
+                nullif(trim(r.bdm), ''),
+                nullif(trim(r.raw_payload->>'BDM'), ''),
+                ''
+            ) as bdm,
+            coalesce(
+                nullif(trim(r.entity), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Entity', r.raw_payload->>'Company')), ''),
+                ''
+            ) as entity,
+            coalesce(
+                nullif(trim(r.vertical), ''),
+                nullif(trim(r.raw_payload->>'Vertical'), ''),
+                ''
+            ) as vertical,
+            coalesce(
+                nullif(trim(r.deal_type), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Deal Type', r.raw_payload->>'Revenue type', r.raw_payload->>'Revenue Type')), ''),
+                ''
+            ) as deal_type,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as business_type,
+            coalesce(
+                nullif(trim(r.strategic_account), ''),
+                nullif(trim(r.raw_payload->>'Strategic Account'), ''),
+                ''
+            ) as strategic_account,
+            coalesce(
+                nullif(trim(r.eeennn), ''),
+                nullif(trim(coalesce(r.raw_payload->>'EEENNN', r.raw_payload->>'EENNN')), ''),
+                ''
+            ) as eeennn,
+            coalesce(
+                nullif(trim(r.ocn_number), ''),
+                nullif(trim(coalesce(r.raw_payload->>'OCN Number', r.raw_payload->>'OCN', r.raw_payload->>'OCN No')), ''),
+                ''
+            ) as ocn_number,
+            coalesce(
+                nullif(trim(r.resource_id), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Emp ID', r.raw_payload->>'Employee ID', r.raw_payload->>'Resource ID')), ''),
+                ''
+            ) as resource_id,
+            budget_months.month,
+            coalesce(budget_months.amount, 0) as amount
+        from budget_records r
+        join budget_uploads u on u.id = r.upload_id
+        cross join lateral (
+            values
+              ('Apr', coalesce(r.apr_2026, 0)),
+              ('May', coalesce(r.may_2026, 0)),
+              ('Jun', coalesce(r.jun_2026, 0)),
+              ('Jul', coalesce(r.jul_2026, 0)),
+              ('Aug', coalesce(r.aug_2026, 0)),
+              ('Sep', coalesce(r.sep_2026, 0)),
+              ('Oct', coalesce(r.oct_2026, 0)),
+              ('Nov', coalesce(r.nov_2026, 0)),
+              ('Dec', coalesce(r.dec_2026, 0)),
+              ('Jan', coalesce(r.jan_2027, 0)),
+              ('Feb', coalesce(r.feb_2027, 0)),
+              (
+                'Mar',
+                coalesce(r.mar_2027, 0)
+                + (
+                    coalesce(r.fy, 0)
+                    - (
+                        coalesce(r.apr_2026, 0)
+                        + coalesce(r.may_2026, 0)
+                        + coalesce(r.jun_2026, 0)
+                        + coalesce(r.jul_2026, 0)
+                        + coalesce(r.aug_2026, 0)
+                        + coalesce(r.sep_2026, 0)
+                        + coalesce(r.oct_2026, 0)
+                        + coalesce(r.nov_2026, 0)
+                        + coalesce(r.dec_2026, 0)
+                        + coalesce(r.jan_2027, 0)
+                        + coalesce(r.feb_2027, 0)
+                        + coalesce(r.mar_2027, 0)
+                    )
+                  )
+              )
+        ) as budget_months(month, amount)
+        where u.is_active = true
+          and u.financial_year = %s
+          and r.financial_year = %s
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, (financial_year, financial_year))
+        rows = cursor.fetchall()
+    return _normalize_overview_frame(
+        pd.DataFrame(rows),
+        infer_ms_ps_from_identifiers=False,
+    )
+
+
+def _kiosk_bucket_region_row_usa(region: str) -> str:
+    aliased = _normalize_geography_alias(region)
+    compact = str(aliased or "").upper().replace(" ", "")
+    if compact in US_GEOGRAPHY_ALIASES or compact in {"USA", "US"}:
+        return "USA"
+    return "ROW"
+
+
+def _kiosk_ms_ps_slot(ms_ps: str) -> str:
+    text = str(ms_ps or "").strip().upper()
+    if text.startswith("M"):
+        return "MS"
+    if text.startswith("P"):
+        return "PS"
+    return ""
+
+
+def _kiosk_lifecycle_label(raw: str) -> str:
+    key = str(raw or "").strip().lower()
+    if "renew" in key:
+        return "Renewal"
+    if "exist" in key:
+        return "Existing"
+    if "new" in key or "growth" in key:
+        return "New"
+    text = str(raw or "").strip()
+    return text if text else "Unassigned"
+
+
+def _kiosk_engagement_code(raw: str) -> str:
+    text = str(raw or "").strip().upper()
+    for token in ("EE", "EN", "NN"):
+        if text.startswith(token):
+            return token
+    return text if text else "Unassigned"
+
+
+def _kiosk_strategic_label(raw: str) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return "No"
+    if text in {"y", "yes", "true", "1", "strategic"}:
+        return "Yes"
+    if "yes" in text or text.startswith("y"):
+        return "Yes"
+    return "No"
+
+
+def _kiosk_vertical_label(raw: str) -> str:
+    text = str(raw or "").strip()
+    compact = re.sub(r"[^a-z0-9]", "", text.lower())
+    if compact in {"its", "na"}:
+        return "TBD"
+    return text if text else "TBD"
+
+
+def _kiosk_entity_label(raw: str) -> str:
+    text = str(raw or "").strip().upper()
+    return text if text else "Unassigned"
+
+
+def _kiosk_prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "customer_name",
+                "group_company",
+                "project_name",
+                "resource_name",
+                "ms_ps",
+                "region",
+                "practice_head",
+                "geo_head",
+                "bdm",
+                "entity",
+                "vertical",
+                "deal_type",
+                "business_type",
+                "ocn_number",
+                "resource_id",
+                "client_name",
+                "month",
+                "strategic_account",
+                "eeennn",
+                "amount",
+                "ms_ps_slot",
+            ]
+        )
+    out = frame.copy()
+    out["ms_ps_slot"] = out["ms_ps"].map(_kiosk_ms_ps_slot)
+    out = out[out["ms_ps_slot"].isin(["MS", "PS"])].copy()
+    out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0.0)
+    return out
+
+
+def _kiosk_pivot_ms_ps(
+    prepared: pd.DataFrame,
+    label_column: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    label = "Row Labels"
+    headers = [label, "MS", "PS", "Grand Total"]
+    if prepared.empty or label_column not in prepared.columns:
+        zero_row = {label: "Grand Total", "MS": 0.0, "PS": 0.0, "Grand Total": 0.0}
+        return [zero_row], headers
+
+    grouped = (
+        prepared.groupby([label_column, "ms_ps_slot"], dropna=False)["amount"]
+        .sum()
+        .unstack(fill_value=0.0)
+    )
+    for col in ("MS", "PS"):
+        if col not in grouped.columns:
+            grouped[col] = 0.0
+    grouped["Grand Total"] = grouped["MS"] + grouped["PS"]
+    grouped = grouped.sort_values("Grand Total", ascending=False)
+
+    rows: list[dict[str, Any]] = []
+    for idx, row in grouped.iterrows():
+        lab = str(idx).strip() or "Unassigned"
+        rows.append(
+            {
+                label: lab,
+                "MS": float(row["MS"]),
+                "PS": float(row["PS"]),
+                "Grand Total": float(row["Grand Total"]),
+            }
+        )
+
+    g_ms = float(grouped["MS"].sum())
+    g_ps = float(grouped["PS"].sum())
+    rows.append(
+        {
+            label: "Grand Total",
+            "MS": g_ms,
+            "PS": g_ps,
+            "Grand Total": g_ms + g_ps,
+        }
+    )
+    return rows, headers
+
+
+def _kiosk_pivot_engagement_region(prepared: pd.DataFrame) -> tuple[list[dict[str, Any]], list[str]]:
+    label = "Row Labels"
+    headers = [label, "ROW", "USA", "Grand Total"]
+    if prepared.empty:
+        zero_row = {label: "Grand Total", "ROW": 0.0, "USA": 0.0, "Grand Total": 0.0}
+        return [zero_row], headers
+
+    scoped = prepared.copy()
+    scoped["_ee"] = scoped["eeennn"].map(_kiosk_engagement_code)
+    scoped["_geo"] = scoped["region"].map(_kiosk_bucket_region_row_usa)
+    grouped = scoped.groupby(["_ee", "_geo"], dropna=False)["amount"].sum().unstack(fill_value=0.0)
+    for col in ("ROW", "USA"):
+        if col not in grouped.columns:
+            grouped[col] = 0.0
+    grouped["Grand Total"] = pd.to_numeric(grouped["ROW"], errors="coerce").fillna(0.0) + pd.to_numeric(
+        grouped["USA"], errors="coerce"
+    ).fillna(0.0)
+    grouped = grouped.sort_values("Grand Total", ascending=False)
+
+    rows: list[dict[str, Any]] = []
+    for idx, row in grouped.iterrows():
+        lab = str(idx).strip() or "Unassigned"
+        rows.append(
+            {
+                label: lab,
+                "ROW": float(row["ROW"]),
+                "USA": float(row["USA"]),
+                "Grand Total": float(row["Grand Total"]),
+            }
+        )
+
+    g_row = float(grouped["ROW"].sum())
+    g_usa = float(grouped["USA"].sum())
+    rows.append(
+        {
+            label: "Grand Total",
+            "ROW": g_row,
+            "USA": g_usa,
+            "Grand Total": g_row + g_usa,
+        }
+    )
+    return rows, headers
+
+
+def _kiosk_country_budget_forecast(
+    budget_prepared: pd.DataFrame,
+    forecast_prepared: pd.DataFrame,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    label = "Row Labels"
+    headers = [
+        label,
+        "MS",
+        "PS",
+        "Grand Total",
+        "Forecast MS",
+        "Forecast PS",
+        "Forecast Total",
+    ]
+
+    def pivot_no_total(prep: pd.DataFrame, lbl_col: str) -> pd.DataFrame:
+        if prep.empty or lbl_col not in prep.columns:
+            return pd.DataFrame(columns=["Row Labels", "MS", "PS", "Grand Total"])
+        g = (
+            prep.groupby([lbl_col, "ms_ps_slot"], dropna=False)["amount"]
+            .sum()
+            .unstack(fill_value=0.0)
+        )
+        for col in ("MS", "PS"):
+            if col not in g.columns:
+                g[col] = 0.0
+        g["Grand Total"] = g["MS"] + g["PS"]
+        g = g.reset_index().rename(columns={lbl_col: label})
+        return g
+
+    b = pivot_no_total(budget_prepared, "_entity")
+    f = pivot_no_total(forecast_prepared, "_entity")
+    if b.empty and f.empty:
+        z = {
+            label: "Grand Total",
+            "MS": 0.0,
+            "PS": 0.0,
+            "Grand Total": 0.0,
+            "Forecast MS": 0.0,
+            "Forecast PS": 0.0,
+            "Forecast Total": 0.0,
+        }
+        return [z], headers
+
+    if b.empty:
+        merged = f.copy()
+        merged["Forecast MS"] = pd.to_numeric(merged["MS"], errors="coerce").fillna(0.0)
+        merged["Forecast PS"] = pd.to_numeric(merged["PS"], errors="coerce").fillna(0.0)
+        merged["Forecast Total"] = pd.to_numeric(merged["Grand Total"], errors="coerce").fillna(0.0)
+        merged["MS"] = 0.0
+        merged["PS"] = 0.0
+        merged["Grand Total"] = 0.0
+    elif f.empty:
+        merged = b.copy()
+        merged["Forecast MS"] = 0.0
+        merged["Forecast PS"] = 0.0
+        merged["Forecast Total"] = 0.0
+    else:
+        merged = b.merge(f, on=label, how="outer", suffixes=("", "_f"))
+        merged["MS"] = pd.to_numeric(merged.get("MS"), errors="coerce").fillna(0.0)
+        merged["PS"] = pd.to_numeric(merged.get("PS"), errors="coerce").fillna(0.0)
+        merged["Grand Total"] = pd.to_numeric(merged.get("Grand Total"), errors="coerce").fillna(0.0)
+        merged["Forecast MS"] = pd.to_numeric(merged.get("MS_f"), errors="coerce").fillna(0.0)
+        merged["Forecast PS"] = pd.to_numeric(merged.get("PS_f"), errors="coerce").fillna(0.0)
+        merged["Forecast Total"] = pd.to_numeric(merged.get("Grand Total_f"), errors="coerce").fillna(0.0)
+
+    merged = merged.sort_values("Grand Total", ascending=False)
+
+    rows: list[dict[str, Any]] = []
+    for _, row in merged.iterrows():
+        rows.append(
+            {
+                label: str(row[label]),
+                "MS": float(row["MS"]),
+                "PS": float(row["PS"]),
+                "Grand Total": float(row["Grand Total"]),
+                "Forecast MS": float(row["Forecast MS"]),
+                "Forecast PS": float(row["Forecast PS"]),
+                "Forecast Total": float(row["Forecast Total"]),
+            }
+        )
+
+    rows.append(
+        {
+            label: "Grand Total",
+            "MS": float(merged["MS"].sum()),
+            "PS": float(merged["PS"].sum()),
+            "Grand Total": float(merged["Grand Total"].sum()),
+            "Forecast MS": float(merged["Forecast MS"].sum()),
+            "Forecast PS": float(merged["Forecast PS"].sum()),
+            "Forecast Total": float(merged["Forecast Total"].sum()),
+        }
+    )
+    return rows, headers
+
+
+def _empty_budget_kiosk_payload(financial_year: str, database_status: dict[str, str]) -> dict[str, Any]:
+    return {
+        "database": database_status,
+        "financialYear": financial_year or "",
+        "periodFrom": "Apr",
+        "periodTo": "Mar",
+        "tables": {},
+    }
+
+
+def build_revenue_budget_kiosk_payload(filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    database_status = get_database_status()
+    normalized = _normalize_filters(filters, default_year="")
+    selected_year = normalized.financial_years[0] if normalized.financial_years else ""
+    cache_key: tuple[Any, ...] | None = None
+
+    months = _resolve_period_months(normalized.period_from, normalized.period_to)
+    if not months:
+        months = list(MONTH_LABELS)
+
+    try:
+        ensure_postgres_schema()
+        with open_database_connection(require=False) as connection:
+            if connection is None:
+                if not selected_year:
+                    return _empty_budget_kiosk_payload("", database_status)
+                return _empty_budget_kiosk_payload(selected_year, database_status)
+
+            if not selected_year:
+                selected_year = _resolve_latest_workspace_financial_year(connection)
+                if not selected_year:
+                    return _empty_budget_kiosk_payload("", database_status)
+                normalized.financial_years = [selected_year]
+
+            data_version = _resolve_workspace_data_version(connection, selected_year)
+            cache_key = ("budget-kiosk", data_version, *_filters_cache_key(normalized))
+            cached_payload = _read_cached_payload(_BUDGET_KIOSK_PAYLOAD_CACHE, cache_key)
+            if cached_payload is not None:
+                return cached_payload
+
+            has_actual_upload = _has_active_actual_upload(connection, selected_year)
+            if has_actual_upload:
+                _ensure_actual_revenue_for_year(connection, selected_year)
+            budget_wide = _load_budget_kiosk_frame(connection, selected_year)
+            actual_df = _load_actual_overview_frame(connection, selected_year)
+            forecast_upload_df = _load_forecast_overview_frame(connection, selected_year)
+            forecast_submission_df = _load_forecast_submission_overview_frame(connection, selected_year)
+            forecast_df = _build_effective_forecast_overview_frame(forecast_upload_df, forecast_submission_df)
+    except Exception:
+        LOGGER.exception("Revenue budget kiosk payload fallback triggered due to data access failure")
+        fallback_cached = _read_latest_cached_payload(_BUDGET_KIOSK_PAYLOAD_CACHE)
+        if fallback_cached is not None:
+            return fallback_cached
+        return _empty_budget_kiosk_payload(selected_year, database_status)
+
+    budget_wide = _normalize_overview_frame(budget_wide) if not budget_wide.empty else budget_wide
+    forecast_df = _normalize_overview_frame(forecast_df) if not forecast_df.empty else forecast_df
+    actual_df = _normalize_overview_frame(
+        actual_df,
+        infer_ms_ps_from_identifiers=False,
+    ) if not actual_df.empty else actual_df
+
+    budget_df = _apply_filters(budget_wide, normalized) if not budget_wide.empty else budget_wide
+    if budget_df.empty:
+        return _empty_budget_kiosk_payload(selected_year, database_status)
+    if forecast_df.empty:
+        forecast_long = forecast_df
+    elif "month" in forecast_df.columns and "amount" in forecast_df.columns:
+        # _build_effective_forecast_overview_frame() already returns a long frame.
+        forecast_long = _normalize_overview_frame(forecast_df)
+    else:
+        forecast_long = _forecast_overview_wide_to_long(forecast_df)
+    forecast_long = _apply_filters(forecast_long, normalized) if not forecast_long.empty else forecast_long
+    if forecast_long.empty and not budget_df.empty:
+        forecast_long = budget_df.copy()
+
+    budget_slice = budget_df[budget_df["month"].isin(months)].copy() if not budget_df.empty else budget_df
+    forecast_slice = forecast_long[forecast_long["month"].isin(months)].copy() if not forecast_long.empty else forecast_long
+
+    bud = _kiosk_prepare_frame(budget_slice)
+    fct = _kiosk_prepare_frame(forecast_slice)
+
+    geo_bud = bud.copy()
+    geo_bud["_geo"] = geo_bud["region"].map(_kiosk_bucket_region_row_usa)
+    geo_rows, geo_headers = _kiosk_pivot_ms_ps(geo_bud, "_geo")
+
+    lifecycle_bud = bud.copy()
+    lifecycle_bud["_life"] = lifecycle_bud["deal_type"].map(_kiosk_lifecycle_label)
+    life_rows, life_headers = _kiosk_pivot_ms_ps(lifecycle_bud, "_life")
+
+    eng_bud = bud.copy()
+    eng_bud["_eng"] = eng_bud["eeennn"].map(_kiosk_engagement_code)
+    eng_del_rows, eng_del_headers = _kiosk_pivot_ms_ps(eng_bud, "_eng")
+
+    eng_reg_rows, eng_reg_headers = _kiosk_pivot_engagement_region(bud)
+
+    country_bud = bud.copy()
+    country_bud["_entity"] = country_bud["entity"].map(_kiosk_entity_label)
+    country_fct = fct.copy()
+    country_fct["_entity"] = country_fct["entity"].map(_kiosk_entity_label)
+    country_rows, country_headers = _kiosk_country_budget_forecast(country_bud, country_fct)
+
+    vert_bud = bud.copy()
+    vert_bud["_vert"] = vert_bud["vertical"].map(_kiosk_vertical_label)
+    vert_rows, vert_headers = _kiosk_pivot_ms_ps(vert_bud, "_vert")
+
+    strat_bud = bud.copy()
+    strat_bud["_strat"] = strat_bud["strategic_account"].map(_kiosk_strategic_label)
+    strat_rows, strat_headers = _kiosk_pivot_ms_ps(strat_bud, "_strat")
+
+    def pack(headers: list[str], rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {"headers": headers, "rows": rows}
+
+    payload = {
+        "database": database_status,
+        "financialYear": selected_year,
+        "periodFrom": months[0],
+        "periodTo": months[-1],
+        "tables": {
+            "geo-delivery": pack(geo_headers, geo_rows),
+            "project-lifecycle": pack(life_headers, life_rows),
+            "engagement-delivery": pack(eng_del_headers, eng_del_rows),
+            "engagement-region": pack(eng_reg_headers, eng_reg_rows),
+            "country-delivery": pack(country_headers, country_rows),
+            "vertical-delivery": pack(vert_headers, vert_rows),
+            "strategic-delivery": pack(strat_headers, strat_rows),
+        },
+    }
+    if cache_key is not None:
+        _write_cached_payload(_BUDGET_KIOSK_PAYLOAD_CACHE, cache_key, payload)
+    return payload
+
+
+def list_revenue_variance_comments(
+    *,
+    financial_year: str,
+    comparison_month: str | None = None,
+    table_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    normalized_year = str(financial_year or "").strip()
+    normalized_month = _normalize_comment_month(comparison_month)
+    normalized_tables = [str(value).strip() for value in (table_ids or []) if str(value).strip()]
+
+    if not normalized_year:
+        return {
+            "financialYear": "",
+            "comparisonMonth": normalized_month,
+            "rows": [],
+        }
+
+    ensure_postgres_schema()
+    with open_database_connection(require=False) as connection:
+        if connection is None:
+            return {
+                "financialYear": normalized_year,
+                "comparisonMonth": normalized_month,
+                "rows": [],
+            }
+
+        where_clauses = ["financial_year = %s"]
+        params: list[Any] = [normalized_year]
+        if normalized_month:
+            where_clauses.append("comparison_month = %s")
+            params.append(normalized_month)
+        if normalized_tables:
+            where_clauses.append("table_id = any(%s)")
+            params.append(normalized_tables)
+
+        query = f"""
+            select
+                financial_year,
+                comparison_month,
+                table_id,
+                row_label,
+                variance_percent,
+                comment_text,
+                authored_by,
+                author_role,
+                created_at,
+                updated_at
+            from revenue_variance_comments
+            where {" and ".join(where_clauses)}
+            order by updated_at desc, id desc
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(query, tuple(params))
+            records = cursor.fetchall()
+
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        rows.append(
+            {
+                "financialYear": str(record.get("financial_year") or ""),
+                "comparisonMonth": str(record.get("comparison_month") or ""),
+                "tableId": str(record.get("table_id") or ""),
+                "rowLabel": str(record.get("row_label") or ""),
+                "variancePercent": float(record.get("variance_percent") or 0.0),
+                "comment": str(record.get("comment_text") or ""),
+                "authoredBy": str(record.get("authored_by") or ""),
+                "authorRole": str(record.get("author_role") or ""),
+                "createdAt": record.get("created_at").isoformat().replace("+00:00", "Z")
+                if record.get("created_at")
+                else None,
+                "updatedAt": record.get("updated_at").isoformat().replace("+00:00", "Z")
+                if record.get("updated_at")
+                else None,
+            }
+        )
+    return {
+        "financialYear": normalized_year,
+        "comparisonMonth": normalized_month,
+        "rows": rows,
+    }
+
+
+def save_revenue_variance_comment(
+    *,
+    financial_year: str,
+    comparison_month: str | None,
+    table_id: str,
+    row_label: str,
+    variance_percent: float | int | None,
+    comment_text: str,
+    authored_by: str | None = None,
+    author_role: str | None = None,
+) -> dict[str, Any]:
+    normalized_year = str(financial_year or "").strip()
+    normalized_month = _normalize_comment_month(comparison_month)
+    normalized_table_id = str(table_id or "").strip()
+    normalized_row_label = str(row_label or "").strip()
+    normalized_comment = str(comment_text or "").strip()
+    normalized_author = str(authored_by or "").strip()
+    normalized_role = str(author_role or "").strip()
+    variance_value = float(variance_percent or 0.0)
+
+    if not normalized_year:
+        raise ValueError("financialYear is required.")
+    if not normalized_month:
+        raise ValueError("comparisonMonth is required.")
+    if not normalized_table_id:
+        raise ValueError("tableId is required.")
+    if not normalized_row_label:
+        raise ValueError("rowLabel is required.")
+
+    ensure_postgres_schema()
+    with open_database_connection(require=True) as connection:
+        assert connection is not None
+        with connection.cursor() as cursor:
+            if not normalized_comment:
+                cursor.execute(
+                    """
+                    delete from revenue_variance_comments
+                    where financial_year = %s
+                      and comparison_month = %s
+                      and table_id = %s
+                      and row_label = %s
+                    """,
+                    (
+                        normalized_year,
+                        normalized_month,
+                        normalized_table_id,
+                        normalized_row_label,
+                    ),
+                )
+                connection.commit()
+                return {
+                    "financialYear": normalized_year,
+                    "comparisonMonth": normalized_month,
+                    "tableId": normalized_table_id,
+                    "rowLabel": normalized_row_label,
+                    "deleted": True,
+                }
+
+            cursor.execute(
+                """
+                insert into revenue_variance_comments (
+                    financial_year,
+                    comparison_month,
+                    table_id,
+                    row_label,
+                    variance_percent,
+                    comment_text,
+                    authored_by,
+                    author_role,
+                    created_at,
+                    updated_at
+                )
+                values (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                on conflict (financial_year, comparison_month, table_id, row_label)
+                do update set
+                    variance_percent = excluded.variance_percent,
+                    comment_text = excluded.comment_text,
+                    authored_by = excluded.authored_by,
+                    author_role = excluded.author_role,
+                    updated_at = now()
+                returning
+                    financial_year,
+                    comparison_month,
+                    table_id,
+                    row_label,
+                    variance_percent,
+                    comment_text,
+                    authored_by,
+                    author_role,
+                    created_at,
+                    updated_at
+                """,
+                (
+                    normalized_year,
+                    normalized_month,
+                    normalized_table_id,
+                    normalized_row_label,
+                    variance_value,
+                    normalized_comment,
+                    normalized_author,
+                    normalized_role,
+                ),
+            )
+            saved = cursor.fetchone() or {}
+        connection.commit()
+
+    return {
+        "financialYear": str(saved.get("financial_year") or normalized_year),
+        "comparisonMonth": str(saved.get("comparison_month") or normalized_month),
+        "tableId": str(saved.get("table_id") or normalized_table_id),
+        "rowLabel": str(saved.get("row_label") or normalized_row_label),
+        "variancePercent": float(saved.get("variance_percent") or variance_value),
+        "comment": str(saved.get("comment_text") or normalized_comment),
+        "authoredBy": str(saved.get("authored_by") or normalized_author),
+        "authorRole": str(saved.get("author_role") or normalized_role),
+        "createdAt": saved.get("created_at").isoformat().replace("+00:00", "Z")
+        if saved.get("created_at")
+        else None,
+        "updatedAt": saved.get("updated_at").isoformat().replace("+00:00", "Z")
+        if saved.get("updated_at")
+        else None,
+    }
+
+
+def _load_active_frames(connection: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
+    records_df, uploads_df = _query_financial_frames(connection)
+
+    if uploads_df.empty:
+        ensure_budget_sync_to_rapid_revenue(connection=connection)
+        records_df, uploads_df = _query_rapid_revenue_frames(connection)
+
+    if uploads_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    return _normalize_loaded_frames(records_df, uploads_df)
+
+
+def _load_budget_overview_frame(connection: Any, financial_year: str) -> pd.DataFrame:
+    query = """
+        select
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.customer_name), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'Updated Customer',
+                            r.raw_payload->>'Updated Customer Name',
+                            r.raw_payload->>'Customer Name',
+                            r.raw_payload->>'Customer'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as customer_name,
+            coalesce(
+                nullif(trim(r.gr_entity), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'GR Entity',
+                            r.raw_payload->>'Entity As per GR',
+                            r.raw_payload->>'Group company',
+                            r.raw_payload->>'Group Company'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as group_company,
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.customer_name), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer'), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer Name'), ''),
+                ''
+            ) as client_name,
+            coalesce(
+                nullif(trim(r.project_name), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Project Name', r.raw_payload->>'Project')), ''),
+                ''
+            ) as project_name,
+            coalesce(
+                nullif(trim(r.resource_name), ''),
+                nullif(trim(r.raw_payload->>'Resource Name'), ''),
+                ''
+            ) as resource_name,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as ms_ps,
+            coalesce(
+                nullif(trim(r.row_us), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'ROW/US',
+                            r.raw_payload->>'Region summary',
+                            r.raw_payload->>'Region Summary',
+                            r.raw_payload->>'Region'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as region,
+            coalesce(
+                nullif(trim(r.practice_head), ''),
+                nullif(trim(r.raw_payload->>'Practice Head'), ''),
+                ''
+            ) as practice_head,
+            coalesce(
+                nullif(trim(r.geo_head), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Geo Head', r.raw_payload->>'GeoHead', r.raw_payload->>'Geo head')), ''),
+                ''
+            ) as geo_head,
+            coalesce(
+                nullif(trim(r.bdm), ''),
+                nullif(trim(r.raw_payload->>'BDM'), ''),
+                ''
+            ) as bdm,
+            coalesce(
+                nullif(trim(r.entity), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Entity', r.raw_payload->>'Company')), ''),
+                ''
+            ) as entity,
+            coalesce(
+                nullif(trim(r.vertical), ''),
+                nullif(trim(r.raw_payload->>'Vertical'), ''),
+                ''
+            ) as vertical,
+            coalesce(
+                nullif(trim(r.deal_type), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Deal Type', r.raw_payload->>'Revenue type', r.raw_payload->>'Revenue Type')), ''),
+                ''
+            ) as deal_type,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as business_type,
+            coalesce(
+                nullif(trim(r.strategic_account), ''),
+                nullif(trim(r.raw_payload->>'Strategic Account'), ''),
+                ''
+            ) as strategic_account,
+            coalesce(
+                nullif(trim(r.eeennn), ''),
+                nullif(trim(coalesce(r.raw_payload->>'EEENNN', r.raw_payload->>'EENNN')), ''),
+                ''
+            ) as eeennn,
+            coalesce(
+                nullif(trim(r.ocn_number), ''),
+                nullif(trim(coalesce(r.raw_payload->>'OCN Number', r.raw_payload->>'OCN', r.raw_payload->>'OCN No')), ''),
+                ''
+            ) as ocn_number,
+            coalesce(
+                nullif(trim(r.resource_id), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Emp ID', r.raw_payload->>'Employee ID', r.raw_payload->>'Resource ID')), ''),
+                ''
+            ) as resource_id,
+            budget_months.month,
+            coalesce(budget_months.amount, 0) as amount
+        from budget_records r
+        join budget_uploads u on u.id = r.upload_id
+        cross join lateral (
+            values
+              ('Apr', coalesce(r.apr_2026, 0)),
+              ('May', coalesce(r.may_2026, 0)),
+              ('Jun', coalesce(r.jun_2026, 0)),
+              ('Jul', coalesce(r.jul_2026, 0)),
+              ('Aug', coalesce(r.aug_2026, 0)),
+              ('Sep', coalesce(r.sep_2026, 0)),
+              ('Oct', coalesce(r.oct_2026, 0)),
+              ('Nov', coalesce(r.nov_2026, 0)),
+              ('Dec', coalesce(r.dec_2026, 0)),
+              ('Jan', coalesce(r.jan_2027, 0)),
+              ('Feb', coalesce(r.feb_2027, 0)),
+              (
+                'Mar',
+                coalesce(r.mar_2027, 0)
+                + (
+                    coalesce(r.fy, 0)
+                    - (
+                        coalesce(r.apr_2026, 0)
+                        + coalesce(r.may_2026, 0)
+                        + coalesce(r.jun_2026, 0)
+                        + coalesce(r.jul_2026, 0)
+                        + coalesce(r.aug_2026, 0)
+                        + coalesce(r.sep_2026, 0)
+                        + coalesce(r.oct_2026, 0)
+                        + coalesce(r.nov_2026, 0)
+                        + coalesce(r.dec_2026, 0)
+                        + coalesce(r.jan_2027, 0)
+                        + coalesce(r.feb_2027, 0)
+                        + coalesce(r.mar_2027, 0)
+                    )
+                  )
+              )
+        ) as budget_months(month, amount)
+        where u.is_active = true
+          and u.financial_year = %s
+          and r.financial_year = %s
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, (financial_year, financial_year))
+        rows = cursor.fetchall()
+    return _normalize_overview_frame(pd.DataFrame(rows))
+
+
+def _load_actual_overview_frame(connection: Any, financial_year: str) -> pd.DataFrame:
+    query = """
+        select
+            ar.customer_name,
+            coalesce(
+                nullif(trim(to_jsonb(ar)->>'group_company'), ''),
+                ''
+            ) as group_company,
+            coalesce(ar.customer_name, '') as client_name,
+            ar.project_name,
+            ar.resource_name,
+            upper(coalesce(ar.ms_ps, '')) as ms_ps,
+            coalesce(ar.region, '') as region,
+            coalesce(ar.practice_head, '') as practice_head,
+            coalesce(ar.geo_head, '') as geo_head,
+            coalesce(ar.bdm, '') as bdm,
+            coalesce(ar.company, '') as entity,
+            coalesce(ar.vertical, '') as vertical,
+            coalesce(ar.revenue_type, '') as deal_type,
+            upper(coalesce(ar.ms_ps, '')) as business_type,
+            coalesce(ar.strategic_account, '') as strategic_account,
+            coalesce(ar.eeennn, '') as eeennn,
+            coalesce(
+                nullif(trim(to_jsonb(ar)->>'ocn_number'), ''),
+                ''
+            ) as ocn_number,
+            coalesce(ar.emp_id, '') as resource_id,
+            ar.month,
+            coalesce(ar.actual_revenue_value, 0) as amount
+        from actual_revenue ar
+        join global_revenue_uploads u on u.id = ar.uploaded_file_id
+        where ar.fy_year = %s
+          and u.financial_year = %s
+          and u.is_active = true
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, (financial_year, financial_year))
+        rows = cursor.fetchall()
+    return _normalize_overview_frame(pd.DataFrame(rows))
+
+
+def _load_forecast_submission_overview_frame(connection: Any, financial_year: str) -> pd.DataFrame:
+    query = """
+        select
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.customer_name), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'Updated Customer',
+                            r.raw_payload->>'Updated Customer Name',
+                            r.raw_payload->>'Customer Name',
+                            r.raw_payload->>'Customer'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as customer_name,
+            coalesce(
+                nullif(trim(r.gr_entity), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'GR Entity',
+                            r.raw_payload->>'Entity As per GR',
+                            r.raw_payload->>'Group company',
+                            r.raw_payload->>'Group Company'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as group_company,
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.customer_name), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer'), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer Name'), ''),
+                ''
+            ) as client_name,
+            coalesce(
+                nullif(trim(r.project_name), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Project Name', r.raw_payload->>'Project')), ''),
+                ''
+            ) as project_name,
+            coalesce(
+                nullif(trim(r.resource_name), ''),
+                nullif(trim(r.raw_payload->>'Resource Name'), ''),
+                ''
+            ) as resource_name,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as ms_ps,
+            coalesce(
+                nullif(trim(r.row_us), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'ROW/US',
+                            r.raw_payload->>'Region summary',
+                            r.raw_payload->>'Region Summary',
+                            r.raw_payload->>'Region'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as region,
+            coalesce(
+                nullif(trim(r.practice_head), ''),
+                nullif(trim(r.raw_payload->>'Practice Head'), ''),
+                ''
+            ) as practice_head,
+            coalesce(
+                nullif(trim(r.geo_head), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Geo Head', r.raw_payload->>'GeoHead', r.raw_payload->>'Geo head')), ''),
+                ''
+            ) as geo_head,
+            coalesce(
+                nullif(trim(r.bdm), ''),
+                nullif(trim(r.raw_payload->>'BDM'), ''),
+                ''
+            ) as bdm,
+            coalesce(
+                nullif(trim(r.entity), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Entity', r.raw_payload->>'Company')), ''),
+                ''
+            ) as entity,
+            coalesce(
+                nullif(trim(r.vertical), ''),
+                nullif(trim(r.raw_payload->>'Vertical'), ''),
+                ''
+            ) as vertical,
+            coalesce(
+                nullif(trim(r.deal_type), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Deal Type', r.raw_payload->>'Revenue type', r.raw_payload->>'Revenue Type')), ''),
+                ''
+            ) as deal_type,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as business_type,
+            coalesce(
+                nullif(trim(r.strategic_account), ''),
+                nullif(trim(r.raw_payload->>'Strategic Account'), ''),
+                ''
+            ) as strategic_account,
+            coalesce(
+                nullif(trim(r.eeennn), ''),
+                nullif(trim(coalesce(r.raw_payload->>'EEENNN', r.raw_payload->>'EENNN')), ''),
+                ''
+            ) as eeennn,
+            coalesce(
+                nullif(trim(r.ocn_number), ''),
+                nullif(trim(coalesce(r.raw_payload->>'OCN Number', r.raw_payload->>'OCN', r.raw_payload->>'OCN No')), ''),
+                ''
+            ) as ocn_number,
+            coalesce(
+                nullif(trim(r.resource_id), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Emp ID', r.raw_payload->>'Employee ID', r.raw_payload->>'Resource ID')), ''),
+                ''
+            ) as resource_id,
+            f.forecast_month as month,
+            coalesce(f.forecast_value, 0) as amount
+        from rapid_forecast_entries f
+        join rapid_revenue_records r on r.id = f.record_id
+        join rapid_revenue_uploads u on u.id = r.upload_id
+        where u.is_active = true
+          and f.financial_year = %s
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, (financial_year,))
+        rows = cursor.fetchall()
+    return _normalize_overview_frame(pd.DataFrame(rows))
+
+
+def _load_forecast_overview_frame(connection: Any, financial_year: str) -> pd.DataFrame:
+    query = """
+        select
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.customer_name), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'Updated Customer',
+                            r.raw_payload->>'Updated Customer Name',
+                            r.raw_payload->>'Customer Name',
+                            r.raw_payload->>'Customer'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as customer_name,
+            coalesce(
+                nullif(trim(r.gr_entity), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'GR Entity',
+                            r.raw_payload->>'Entity As per GR',
+                            r.raw_payload->>'Group company',
+                            r.raw_payload->>'Group Company'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as group_company,
+            coalesce(
+                nullif(trim(r.updated_customer), ''),
+                nullif(trim(r.client_name), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer'), ''),
+                nullif(trim(r.raw_payload->>'Updated Customer Name'), ''),
+                nullif(trim(r.customer_name), ''),
+                ''
+            ) as client_name,
+            coalesce(
+                nullif(trim(r.project_name), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Project Name', r.raw_payload->>'Project')), ''),
+                ''
+            ) as project_name,
+            coalesce(
+                nullif(trim(r.resource_name), ''),
+                nullif(trim(r.raw_payload->>'Resource Name'), ''),
+                ''
+            ) as resource_name,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as ms_ps,
+            coalesce(
+                nullif(trim(r.row_us), ''),
+                nullif(
+                    trim(
+                        coalesce(
+                            r.raw_payload->>'ROW/US',
+                            r.raw_payload->>'Region summary',
+                            r.raw_payload->>'Region Summary',
+                            r.raw_payload->>'Region'
+                        )
+                    ),
+                    ''
+                ),
+                ''
+            ) as region,
+            coalesce(
+                nullif(trim(r.practice_head), ''),
+                nullif(trim(r.raw_payload->>'Practice Head'), ''),
+                ''
+            ) as practice_head,
+            coalesce(
+                nullif(trim(r.geo_head), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Geo Head', r.raw_payload->>'GeoHead', r.raw_payload->>'Geo head')), ''),
+                ''
+            ) as geo_head,
+            coalesce(
+                nullif(trim(r.bdm), ''),
+                nullif(trim(r.raw_payload->>'BDM'), ''),
+                ''
+            ) as bdm,
+            coalesce(
+                nullif(trim(r.entity), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Entity', r.raw_payload->>'Company')), ''),
+                ''
+            ) as entity,
+            coalesce(
+                nullif(trim(r.vertical), ''),
+                nullif(trim(r.raw_payload->>'Vertical'), ''),
+                ''
+            ) as vertical,
+            coalesce(
+                nullif(trim(r.deal_type), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Deal Type', r.raw_payload->>'Revenue type', r.raw_payload->>'Revenue Type')), ''),
+                ''
+            ) as deal_type,
+            upper(
+                coalesce(
+                    nullif(trim(r.ms_ps), ''),
+                    nullif(
+                        trim(
+                            coalesce(
+                                r.raw_payload->>'MS/PS',
+                                r.raw_payload->>'PS/MS',
+                                r.raw_payload->>'PS/MS budget',
+                                r.raw_payload->>'MS/PS budget'
+                            )
+                        ),
+                        ''
+                    ),
+                    ''
+                )
+            ) as business_type,
+            coalesce(
+                nullif(trim(r.strategic_account), ''),
+                nullif(trim(r.raw_payload->>'Strategic Account'), ''),
+                ''
+            ) as strategic_account,
+            coalesce(
+                nullif(trim(r.eeennn), ''),
+                nullif(trim(coalesce(r.raw_payload->>'EEENNN', r.raw_payload->>'EENNN')), ''),
+                ''
+            ) as eeennn,
+            coalesce(
+                nullif(trim(r.ocn_number), ''),
+                nullif(trim(coalesce(r.raw_payload->>'OCN Number', r.raw_payload->>'OCN', r.raw_payload->>'OCN No')), ''),
+                ''
+            ) as ocn_number,
+            coalesce(
+                nullif(trim(r.resource_id), ''),
+                nullif(trim(coalesce(r.raw_payload->>'Emp ID', r.raw_payload->>'Employee ID', r.raw_payload->>'Resource ID')), ''),
+                ''
+            ) as resource_id,
+            r.apr_2026,
+            r.may_2026,
+            r.jun_2026,
+            r.jul_2026,
+            r.aug_2026,
+            r.sep_2026,
+            r.oct_2026,
+            r.nov_2026,
+            r.dec_2026,
+            r.jan_2027,
+            r.feb_2027,
+            r.mar_2027
+        from forecast_records r
+        join forecast_uploads u on u.id = r.upload_id
+        where u.is_active = true
+          and r.financial_year = %s
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, (financial_year,))
+        rows = cursor.fetchall()
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+
+    normalized_frame = frame.copy()
+    for column in [
+        "customer_name",
+        "updated_customer",
+        "group_company",
+        "project_name",
+        "resource_name",
+        "ms_ps",
+        "region",
+        "practice_head",
+        "geo_head",
+        "bdm",
+        "entity",
+        "vertical",
+        "deal_type",
+        "business_type",
+        "strategic_account",
+        "eeennn",
+        "ocn_number",
+        "resource_id",
+        "client_name",
+    ]:
+        normalized_frame[column] = (
+            normalized_frame[column].fillna("").astype(str).replace({"nan": ""})
+        )
+
+    for column in OVERVIEW_FORECAST_MONTH_COLUMNS.values():
+        normalized_frame[column] = pd.to_numeric(
+            normalized_frame[column],
+            errors="coerce",
+        ).fillna(0.0)
+
+    return normalized_frame
+
+
+def _forecast_overview_wide_to_long(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=[*OVERVIEW_FORECAST_DIMENSION_COLUMNS, "month", "amount"])
+
+    month_frames: list[pd.DataFrame] = []
+    for month, month_column in OVERVIEW_FORECAST_MONTH_COLUMNS.items():
+        scoped = frame[[*OVERVIEW_FORECAST_DIMENSION_COLUMNS, month_column]].copy()
+        scoped["month"] = month
+        scoped["amount"] = pd.to_numeric(scoped[month_column], errors="coerce").fillna(0.0)
+        scoped = scoped.drop(columns=[month_column])
+        month_frames.append(scoped)
+
+    if not month_frames:
+        return pd.DataFrame(columns=[*OVERVIEW_FORECAST_DIMENSION_COLUMNS, "month", "amount"])
+
+    merged = pd.concat(month_frames, ignore_index=True)
+    return _normalize_overview_frame(merged)
+
+
+def _build_effective_forecast_overview_frame(
+    forecast_upload_wide_df: pd.DataFrame,
+    forecast_submission_df: pd.DataFrame,
+) -> pd.DataFrame:
+    submission = _normalize_overview_frame(forecast_submission_df)
+    upload_long = _forecast_overview_wide_to_long(forecast_upload_wide_df)
+
+    if upload_long.empty:
+        return submission
+    if submission.empty:
+        return upload_long
+
+    key_columns = [*OVERVIEW_FORECAST_DIMENSION_COLUMNS, "month"]
+    upload_indexed = upload_long.set_index(key_columns)
+    submission_indexed = submission.set_index(key_columns)
+    upload_without_submission = upload_indexed.loc[
+        ~upload_indexed.index.isin(submission_indexed.index)
+    ]
+    merged = pd.concat([upload_without_submission, submission_indexed], axis=0)
+    merged = merged.reset_index()
+    merged["amount"] = pd.to_numeric(merged["amount"], errors="coerce").fillna(0.0)
+    return _normalize_overview_frame(merged)
+
+
+def _ensure_actual_revenue_for_year(connection: Any, financial_year: str) -> None:
+    if not financial_year:
+        return
+
+    now = time.monotonic()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "alter table if exists actual_revenue add column if not exists ocn_number text"
+        )
+        cursor.execute(
+            """
+            create index if not exists actual_revenue_ocn_idx
+              on actual_revenue (lower(coalesce(ocn_number, '')))
+            """
+        )
+        cursor.execute(
+            """
+            select
+                u.id::text as upload_id,
+                coalesce(u.upload_month, '') as upload_month,
+                case lower(left(trim(coalesce(u.upload_month, '')), 3))
+                    when 'apr' then 'apr'
+                    when 'may' then 'may'
+                    when 'jun' then 'jun'
+                    when 'jul' then 'jul'
+                    when 'aug' then 'aug'
+                    when 'sep' then 'sep'
+                    when 'oct' then 'oct'
+                    when 'nov' then 'nov'
+                    when 'dec' then 'dec'
+                    when 'jan' then 'jan'
+                    when 'feb' then 'feb'
+                    when 'mar' then 'mar'
+                    else ''
+                end as upload_month_key
+            from global_revenue_uploads u
+            where u.financial_year = %s
+              and u.is_active = true
+            order by
+                case lower(left(trim(coalesce(u.upload_month, '')), 3))
+                    when 'apr' then 0
+                    when 'may' then 1
+                    when 'jun' then 2
+                    when 'jul' then 3
+                    when 'aug' then 4
+                    when 'sep' then 5
+                    when 'oct' then 6
+                    when 'nov' then 7
+                    when 'dec' then 8
+                    when 'jan' then 9
+                    when 'feb' then 10
+                    when 'mar' then 11
+                    else 99
+                end desc,
+                u.uploaded_at desc nulls last,
+                u.id desc
+            """,
+            (financial_year,),
+        )
+        active_uploads = cursor.fetchall()
+        if not active_uploads:
+            _ACTUAL_REFRESH_CHECK_STATE.pop(financial_year, None)
+            return
+
+        upload_ids: list[str] = []
+        signature_parts: list[str] = []
+        for upload in active_uploads:
+            upload_id = str(upload.get("upload_id") or "").strip()
+            if not upload_id:
+                continue
+            month_key = str(upload.get("upload_month_key") or "").strip().lower()
+            upload_ids.append(upload_id)
+            signature_parts.append(f"{month_key or '*'}:{upload_id}")
+
+        if not upload_ids:
+            _ACTUAL_REFRESH_CHECK_STATE.pop(financial_year, None)
+            return
+
+        upload_signature = ",".join(sorted(signature_parts))
+        prior_state = _ACTUAL_REFRESH_CHECK_STATE.get(financial_year)
+        if prior_state and prior_state[0] == upload_signature and now - prior_state[1] < ACTUAL_REFRESH_CHECK_TTL_SECONDS:
+            return
+
+        cursor.execute(
+            """
+            select
+                count(*) as total_rows,
+                count(*) filter (where uploaded_file_id::text = any(%s)) as selected_upload_rows
+            from actual_revenue
+            where fy_year = %s
+            """,
+            (upload_ids, financial_year),
+        )
+        stats = cursor.fetchone() or {}
+        selected_upload_rows = int(stats.get("selected_upload_rows") or 0)
+        if selected_upload_rows > 0:
+            _ACTUAL_REFRESH_CHECK_STATE[financial_year] = (
+                upload_signature,
+                now,
+            )
+            return
+
+    refresh_actual_revenue(financial_year, connection)
+    connection.commit()
+    _ACTUAL_REFRESH_CHECK_STATE[financial_year] = (
+        upload_signature,
+        time.monotonic(),
+    )
+
+
+def _has_active_budget_upload(connection: Any, financial_year: str) -> bool:
+    if not financial_year:
+        return False
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            select 1
+            from budget_uploads
+            where financial_year = %s
+              and is_active = true
+            limit 1
+            """,
+            (financial_year,),
+        )
+        return cursor.fetchone() is not None
+
+
+def _has_budget_data_for_year(connection: Any, financial_year: str) -> bool:
+    if not financial_year:
+        return False
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            select 1
+            from budget_data
+            where fy_year = %s
+            limit 1
+            """,
+            (financial_year,),
+        )
+        return cursor.fetchone() is not None
+
+
+def _resolve_latest_workspace_financial_year(connection: Any) -> str:
+    query = """
+        with active_uploads as (
+            select financial_year, uploaded_at
+            from budget_uploads
+            where is_active = true
+            union all
+            select financial_year, uploaded_at
+            from forecast_uploads
+            where is_active = true
+            union all
+            select financial_year, uploaded_at
+            from global_revenue_uploads
+            where is_active = true
+            union all
+            select financial_year, uploaded_at
+            from rapid_revenue_uploads
+            where is_active = true
+        )
+        select financial_year
+        from active_uploads
+        where nullif(trim(coalesce(financial_year, '')), '') is not null
+        order by uploaded_at desc nulls last, financial_year desc
+        limit 1
+    """
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            row = cursor.fetchone() or {}
+            return str(row.get("financial_year") or "").strip()
+    except Exception:
+        LOGGER.exception("Unable to resolve default workspace financial year")
+        return ""
+
+
+def _has_active_actual_upload(connection: Any, financial_year: str) -> bool:
+    if not financial_year:
+        return False
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            select 1
+            from global_revenue_uploads
+            where financial_year = %s
+              and is_active = true
+            limit 1
+            """,
+            (financial_year,),
+        )
+        return cursor.fetchone() is not None
+
+
+def _query_financial_frames(connection: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
+    uploads_query = """
+        select
+            id::text as id,
+            financial_year,
+            original_filename,
+            stored_filename,
+            uploaded_at,
+            imported_rows,
+            parsed_sheets,
+            matched_columns,
+            is_active
+        from financial_workbook_uploads
+        where is_active = true
+        order by uploaded_at desc
+    """
+    record_columns = ", ".join(
+        [
+            "u.id::text as upload_id",
+            "u.financial_year as financial_year",
+            "u.original_filename",
+            "u.uploaded_at",
+            "u.imported_rows",
+            "u.parsed_sheets",
+            "u.matched_columns",
+            "r.source_sheet",
+            "r.source_row_number",
+            *[f"r.{field.key}" for field in FIELD_SPECS],
+        ]
+    )
+    records_query = f"""
+        select {record_columns}
+        from financial_records r
+        join financial_workbook_uploads u on u.id = r.upload_id
+        where u.is_active = true
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(uploads_query)
+        upload_rows = cursor.fetchall()
+        cursor.execute(records_query)
+        record_rows = cursor.fetchall()
+
+    return pd.DataFrame(record_rows), pd.DataFrame(upload_rows)
+
+
+def _query_rapid_revenue_frames(connection: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
+    uploads_query = """
+        select
+            id::text as id,
+            financial_year,
+            original_filename,
+            stored_filename,
+            uploaded_at,
+            imported_rows,
+            parsed_sheets,
+            matched_columns,
+            is_active
+        from rapid_revenue_uploads
+        where is_active = true
+        order by uploaded_at desc
+    """
+    record_columns = ", ".join(
+        [
+            "u.id::text as upload_id",
+            "u.financial_year as financial_year",
+            "u.original_filename",
+            "u.uploaded_at",
+            "u.imported_rows",
+            "u.parsed_sheets",
+            "u.matched_columns",
+            "r.source_sheet",
+            "r.source_row_number",
+            "r.ms_ps as ms_ps",
+            "null::text as classification",
+            "r.entity",
+            "r.gr_entity as entity_as_per_gr",
+            "r.row_us as region",
+            "r.resource_id",
+            "r.resource_name",
+            "r.deal_type",
+            "r.bill_rate",
+            "r.start_date",
+            "r.end_date",
+            "r.apr_2026 as apr_bgt",
+            "r.may_2026 as may_bgt",
+            "r.jun_2026 as jun_bgt",
+            "r.jul_2026 as jul_bgt",
+            "r.aug_2026 as aug_bgt",
+            "r.sep_2026 as sep_bgt",
+            "r.oct_2026 as oct_bgt",
+            "r.nov_2026 as nov_bgt",
+            "r.dec_2026 as dec_bgt",
+            "r.jan_2027 as jan_bgt",
+            "r.feb_2027 as feb_bgt",
+            "r.mar_2027 as mar_bgt",
+            "r.q1 as q1_bgt",
+            "r.q2 as q2_bgt",
+            "r.q3 as q3_bgt",
+            "r.q4 as q4_bgt",
+            "(coalesce(r.q1, 0) + coalesce(r.q2, 0)) as h1_bgt",
+            "(coalesce(r.q3, 0) + coalesce(r.q4, 0)) as h2_bgt",
+            "r.fy as fy_bgt",
+            "r.customer_name",
+            "r.project_name",
+            "r.practice_head",
+            "r.bdm",
+            "null::text as remarks",
+            "null::date as po_end_date",
+            "null::text as bu_head",
+            "r.geo_head",
+            "r.vertical",
+            "coalesce(nullif(r.ms_ps, ''), nullif(r.vertical, ''), nullif(r.horizontal, ''), '') as business_type",
+            "r.apr_2026 as apr_fct",
+            "r.apr_2026 as apr_act",
+            "0::numeric as apr_var",
+            "r.may_2026 as may_fct",
+            "r.may_2026 as may_act",
+            "0::numeric as may_var",
+            "r.jun_2026 as jun_fct",
+            "r.jun_2026 as jun_act",
+            "0::numeric as jun_var",
+            "r.q1 as q1_2025_26",
+            "r.jul_2026 as jul_fct",
+            "r.jul_2026 as jul_act",
+            "0::numeric as jul_var",
+            "r.aug_2026 as aug_fct",
+            "r.aug_2026 as aug_act",
+            "0::numeric as aug_var",
+            "r.sep_2026 as sep_fct",
+            "r.sep_2026 as sep_act",
+            "0::numeric as sep_var",
+            "r.q2 as q2_2025_26",
+            "(coalesce(r.q1, 0) + coalesce(r.q2, 0)) as h1",
+            "r.oct_2026 as oct_fct",
+            "r.oct_2026 as oct_act",
+            "0::numeric as oct_var",
+            "r.nov_2026 as nov_fct",
+            "r.nov_2026 as nov_act",
+            "0::numeric as nov_var",
+            "r.dec_2026 as dec_fct",
+            "r.dec_2026 as dec_act",
+            "0::numeric as dec_var",
+            "r.q3 as q3_2025_26",
+            "r.jan_2027 as jan_fct",
+            "r.jan_2027 as jan_act",
+            "0::numeric as jan_var",
+            "r.feb_2027 as feb_fct",
+            "r.feb_2027 as feb_act",
+            "0::numeric as feb_var",
+            "r.mar_2027 as mar_fct",
+            "r.q4 as q4_2025_26",
+            "(coalesce(r.q3, 0) + coalesce(r.q4, 0)) as h2",
+            "r.fy as fy_25_26",
+        ]
+    )
+    records_query = f"""
+        select {record_columns}
+        from rapid_revenue_records r
+        join rapid_revenue_uploads u on u.id = r.upload_id
+        where u.is_active = true
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(uploads_query)
+        upload_rows = cursor.fetchall()
+        cursor.execute(records_query)
+        record_rows = cursor.fetchall()
+
+    return pd.DataFrame(record_rows), pd.DataFrame(upload_rows)
+
+
+def _normalize_loaded_frames(
+    records_df: pd.DataFrame,
+    uploads_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    uploads_df = uploads_df.copy()
+    uploads_df["uploaded_at"] = pd.to_datetime(uploads_df["uploaded_at"], errors="coerce")
+
+    if records_df.empty:
+        return pd.DataFrame(), uploads_df
+
+    records_df = records_df.copy()
+    for column in NUMERIC_FIELD_KEYS:
+        if column in records_df:
+            records_df[column] = pd.to_numeric(records_df[column], errors="coerce").fillna(0.0)
+
+    for column in DATE_FIELD_KEYS:
+        if column in records_df:
+            records_df[column] = pd.to_datetime(records_df[column], errors="coerce")
+
+    for column in TEXT_FIELD_KEYS:
+        if column in records_df:
+            records_df[column] = (
+                records_df[column]
+                .fillna("")
+                .astype(str)
+                .replace({"nan": "", "NaT": ""})
+            )
+
+    records_df["uploaded_at"] = pd.to_datetime(records_df["uploaded_at"], errors="coerce")
+    return records_df, uploads_df
+
+
+def _normalize_mapping_key(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if pd.isna(value):
+            return ""
+        text = str(int(value)) if value.is_integer() else str(value)
+    elif isinstance(value, Decimal):
+        text = str(int(value)) if value == value.to_integral_value() else str(value)
+    else:
+        text = str(value).strip()
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    text = text.strip().upper()
+    if not text:
+        return ""
+    return re.sub(r"[^A-Z0-9]+", "", text)
+
+
+def _is_blank_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text == "" or text.lower() in {"nan", "nat", "none", "null"}
+
+
+def _prefer_text(candidate: Any, fallback: Any = "") -> str:
+    candidate_text = str(candidate or "").strip()
+    if candidate_text and candidate_text.lower() not in {"nan", "nat", "none", "null"}:
+        return candidate_text
+    fallback_text = str(fallback or "").strip()
+    if fallback_text and fallback_text.lower() not in {"nan", "nat", "none", "null"}:
+        return fallback_text
+    return ""
+
+
+def _mode_text(values: pd.Series) -> str:
+    cleaned = [str(value).strip() for value in values if not _is_blank_text(value)]
+    if not cleaned:
+        return ""
+    counts = pd.Series(cleaned).value_counts()
+    highest = int(counts.iloc[0])
+    tied = [label for label, count in counts.items() if int(count) == highest]
+    tied.sort(key=lambda item: (-len(item), item.lower()))
+    return tied[0]
+
+
+def _dominant_text_by_amount(
+    *,
+    frame: pd.DataFrame,
+    key_column: str,
+    text_column: str,
+    amount_column: str = "amount",
+) -> dict[str, str]:
+    if frame.empty or key_column not in frame.columns or text_column not in frame.columns:
+        return {}
+    if amount_column not in frame.columns:
+        return {}
+
+    scoped = frame.copy()
+    scoped["_group_key"] = scoped[key_column].map(lambda value: str(value or "").strip())
+    scoped["_text_value"] = scoped[text_column].map(lambda value: str(value or "").strip())
+    scoped["_amount_value"] = pd.to_numeric(scoped[amount_column], errors="coerce").fillna(0.0).abs()
+    scoped = scoped[scoped["_group_key"].ne("") & scoped["_text_value"].ne("")]
+    if scoped.empty:
+        return {}
+
+    rolled = (
+        scoped.groupby(["_group_key", "_text_value"], dropna=False)["_amount_value"]
+        .sum()
+        .reset_index()
+        .sort_values(by=["_group_key", "_amount_value", "_text_value"], ascending=[True, False, True])
+    )
+    dominant: dict[str, str] = {}
+    for group_key, group in rolled.groupby("_group_key", sort=False):
+        if group.empty:
+            continue
+        dominant[str(group_key)] = str(group.iloc[0]["_text_value"])
+    return dominant
+
+
+def _customer_name_tokens(value: Any) -> set[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return set()
+    tokens = [token for token in re.split(r"[^a-z0-9]+", text) if token]
+    return {
+        token
+        for token in tokens
+        if len(token) >= 3 and token not in CUSTOMER_ALIAS_STOP_WORDS
+    }
+
+
+def _token_overlap_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    intersection = len(left.intersection(right))
+    if intersection <= 0:
+        return 0.0
+    union = len(left.union(right))
+    return intersection / union if union else 0.0
+
+
+def _canonicalize_ms_rows_by_ocn(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "ms_ps" not in frame.columns or "ocn_number" not in frame.columns:
+        return frame
+
+    scoped = frame.copy()
+    scoped["_ocn_key"] = scoped["ocn_number"].map(_normalize_mapping_key)
+    scoped["_ms_ps"] = scoped["ms_ps"].map(_normalize_ms_ps_alias)
+    ms_mask = (scoped["_ms_ps"] == "MS") & scoped["_ocn_key"].ne("")
+    if not ms_mask.any():
+        return scoped.drop(columns=["_ocn_key", "_ms_ps"], errors="ignore")
+
+    ms_rows = scoped.loc[ms_mask].copy()
+    ms_rows["_preferred_customer"] = ms_rows.apply(
+        lambda row: _prefer_text(row.get("client_name"), row.get("customer_name")),
+        axis=1,
+    )
+    customer_map = (
+        ms_rows.groupby("_ocn_key", dropna=False)["_preferred_customer"]
+        .apply(_mode_text)
+        .to_dict()
+    )
+
+    project_map = (
+        ms_rows.groupby("_ocn_key", dropna=False)["project_name"]
+        .apply(_mode_text)
+        .to_dict()
+    )
+
+    fill_maps: dict[str, dict[str, str]] = {}
+    for field in OVERVIEW_MAPPING_FILL_COLUMNS:
+        if field in ms_rows.columns:
+            fill_maps[field] = (
+                ms_rows.groupby("_ocn_key", dropna=False)[field]
+                .apply(_mode_text)
+                .to_dict()
+            )
+
+    ms_index = scoped.index[ms_mask]
+    ms_keys = scoped.loc[ms_index, "_ocn_key"]
+    scoped.loc[ms_index, "customer_name"] = ms_keys.map(
+        lambda key: str(customer_map.get(str(key or ""), "") or "").strip()
+    )
+
+    mapped_projects = ms_keys.map(
+        lambda key: str(project_map.get(str(key or ""), "") or "").strip()
+    )
+    project_update_mask = mapped_projects.ne("")
+    scoped.loc[mapped_projects.index[project_update_mask], "project_name"] = mapped_projects[
+        project_update_mask
+    ]
+
+    for field, field_map in fill_maps.items():
+        mapped_values = ms_keys.map(
+            lambda key: str(field_map.get(str(key or ""), "") or "").strip()
+        )
+        blank_mask = scoped.loc[ms_index, field].map(_is_blank_text)
+        update_mask = blank_mask & mapped_values.ne("")
+        scoped.loc[mapped_values.index[update_mask], field] = mapped_values[update_mask]
+
+    return scoped.drop(columns=["_ocn_key", "_ms_ps"], errors="ignore")
+
+
+def _build_actual_identifier_lookup(
+    actual_df: pd.DataFrame,
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    if actual_df.empty:
+        return {}, {}
+
+    scoped = actual_df.copy()
+    if "ms_ps" not in scoped.columns:
+        return {}, {}
+
+    scoped["_ms_ps"] = scoped["ms_ps"].map(_normalize_ms_ps_alias)
+    scoped["_ocn_key"] = (
+        scoped["ocn_number"].map(_normalize_mapping_key)
+        if "ocn_number" in scoped.columns
+        else ""
+    )
+    scoped["_emp_key"] = (
+        scoped["resource_id"].map(_normalize_mapping_key)
+        if "resource_id" in scoped.columns
+        else ""
+    )
+
+    mapping_fields = tuple(
+        dict.fromkeys(
+            (
+                "customer_name",
+                "project_name",
+                "resource_name",
+                "client_name",
+                *OVERVIEW_MAPPING_FILL_COLUMNS,
+            )
+        )
+    )
+
+    def _lookup_from(
+        grouped: Any,
+        *,
+        dominant_customer_map: dict[str, str] | None = None,
+        dominant_project_map: dict[str, str] | None = None,
+    ) -> dict[str, dict[str, str]]:
+        lookup: dict[str, dict[str, str]] = {}
+        for key, group in grouped:
+            normalized_key = str(key or "").strip()
+            if not normalized_key:
+                continue
+            resolved: dict[str, str] = {}
+            for field in mapping_fields:
+                if field not in group.columns:
+                    resolved[field] = ""
+                    continue
+                if field == "customer_name" and dominant_customer_map:
+                    dominant_customer = str(dominant_customer_map.get(normalized_key) or "").strip()
+                    if dominant_customer:
+                        resolved[field] = dominant_customer
+                        continue
+                if field == "project_name" and dominant_project_map:
+                    dominant_project = str(dominant_project_map.get(normalized_key) or "").strip()
+                    if dominant_project:
+                        resolved[field] = dominant_project
+                        continue
+                resolved[field] = _mode_text(group[field])
+            lookup[normalized_key] = resolved
+        return lookup
+
+    ms_rows = scoped[(scoped["_ms_ps"] == "MS") & scoped["_ocn_key"].ne("")]
+    ps_rows = scoped[(scoped["_ms_ps"] == "PS") & scoped["_emp_key"].ne("")]
+
+    ms_customer_amount_map = _dominant_text_by_amount(
+        frame=ms_rows,
+        key_column="_ocn_key",
+        text_column="customer_name",
+    ) if not ms_rows.empty else {}
+    ms_project_amount_map = _dominant_text_by_amount(
+        frame=ms_rows,
+        key_column="_ocn_key",
+        text_column="project_name",
+    ) if not ms_rows.empty else {}
+    ps_customer_amount_map = _dominant_text_by_amount(
+        frame=ps_rows,
+        key_column="_emp_key",
+        text_column="customer_name",
+    ) if not ps_rows.empty else {}
+    ps_project_amount_map = _dominant_text_by_amount(
+        frame=ps_rows,
+        key_column="_emp_key",
+        text_column="project_name",
+    ) if not ps_rows.empty else {}
+
+    ms_lookup = _lookup_from(
+        ms_rows.groupby("_ocn_key", dropna=False),
+        dominant_customer_map=ms_customer_amount_map,
+        dominant_project_map=ms_project_amount_map,
+    ) if not ms_rows.empty else {}
+    ps_lookup = _lookup_from(
+        ps_rows.groupby("_emp_key", dropna=False),
+        dominant_customer_map=ps_customer_amount_map,
+        dominant_project_map=ps_project_amount_map,
+    ) if not ps_rows.empty else {}
+    return ms_lookup, ps_lookup
+
+
+def _build_budget_identifier_lookup(
+    budget_df: pd.DataFrame,
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    if budget_df.empty:
+        return {}, {}
+
+    scoped = budget_df.copy()
+    if "ms_ps" not in scoped.columns:
+        return {}, {}
+
+    scoped["_ms_ps"] = scoped["ms_ps"].map(_normalize_ms_ps_alias)
+    scoped["_ocn_key"] = (
+        scoped["ocn_number"].map(_normalize_mapping_key)
+        if "ocn_number" in scoped.columns
+        else ""
+    )
+    scoped["_emp_key"] = (
+        scoped["resource_id"].map(_normalize_mapping_key)
+        if "resource_id" in scoped.columns
+        else ""
+    )
+
+    mapping_fields = (
+        "group_company",
+        "customer_name",
+        "project_name",
+        "client_name",
+        "eeennn",
+        "strategic_account",
+    )
+
+    def _lookup_from(grouped: Any) -> dict[str, dict[str, str]]:
+        lookup: dict[str, dict[str, str]] = {}
+        for key, group in grouped:
+            normalized_key = str(key or "").strip()
+            if not normalized_key:
+                continue
+            resolved: dict[str, str] = {}
+            for field in mapping_fields:
+                if field not in group.columns:
+                    resolved[field] = ""
+                    continue
+                if field in {"group_company", "customer_name", "project_name"}:
+                    dominant = _dominant_text_by_amount(
+                        frame=group,
+                        key_column="_lookup_key",
+                        text_column=field,
+                    )
+                    dominant_value = str(dominant.get(normalized_key) or "").strip()
+                    if dominant_value:
+                        resolved[field] = dominant_value
+                        continue
+                resolved[field] = _mode_text(group[field])
+            lookup[normalized_key] = resolved
+        return lookup
+
+    ms_rows = scoped[(scoped["_ms_ps"] == "MS") & scoped["_ocn_key"].ne("")].copy()
+    ps_rows = scoped[(scoped["_ms_ps"] == "PS") & scoped["_emp_key"].ne("")].copy()
+    if not ms_rows.empty:
+        ms_rows["_lookup_key"] = ms_rows["_ocn_key"]
+    if not ps_rows.empty:
+        ps_rows["_lookup_key"] = ps_rows["_emp_key"]
+
+    ms_lookup = _lookup_from(ms_rows.groupby("_ocn_key", dropna=False)) if not ms_rows.empty else {}
+    ps_lookup = _lookup_from(ps_rows.groupby("_emp_key", dropna=False)) if not ps_rows.empty else {}
+    return ms_lookup, ps_lookup
+
+
+def _apply_budget_group_company_to_actuals(
+    actual_df: pd.DataFrame,
+    budget_identifier_lookup: tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]],
+) -> pd.DataFrame:
+    if actual_df.empty:
+        return actual_df
+
+    ms_lookup, ps_lookup = budget_identifier_lookup
+    if not ms_lookup and not ps_lookup:
+        return actual_df
+
+    aligned = actual_df.copy()
+    aligned["_ms_ps"] = (
+        aligned["ms_ps"].map(_normalize_ms_ps_alias) if "ms_ps" in aligned.columns else ""
+    )
+    aligned["_ocn_key"] = (
+        aligned["ocn_number"].map(_normalize_mapping_key)
+        if "ocn_number" in aligned.columns
+        else ""
+    )
+    aligned["_emp_key"] = (
+        aligned["resource_id"].map(_normalize_mapping_key)
+        if "resource_id" in aligned.columns
+        else ""
+    )
+
+    inferred_ms_mask = aligned["_ms_ps"].eq("") & aligned["_ocn_key"].ne("")
+    inferred_ps_mask = (
+        aligned["_ms_ps"].eq("") & aligned["_ocn_key"].eq("") & aligned["_emp_key"].ne("")
+    )
+    ms_mask = (
+        aligned["_ms_ps"].eq("MS") | inferred_ms_mask
+    ) & aligned["_ocn_key"].isin(ms_lookup.keys())
+    ps_mask = (
+        aligned["_ms_ps"].eq("PS") | inferred_ps_mask
+    ) & aligned["_emp_key"].isin(ps_lookup.keys())
+
+    def _lookup_field(
+        lookup: dict[str, dict[str, str]],
+        keys: pd.Series,
+        field: str,
+    ) -> pd.Series:
+        return keys.map(
+            lambda key: _prefer_text(lookup.get(str(key or ""), {}).get(field))
+        )
+
+    def _apply_lookup(mask: pd.Series, lookup: dict[str, dict[str, str]], key_column: str) -> None:
+        if not mask.any():
+            return
+        keys = aligned.loc[mask, key_column]
+        group_values = _lookup_field(lookup, keys, "group_company")
+        group_update_mask = group_values.ne("")
+        aligned.loc[group_values.index[group_update_mask], "group_company"] = group_values[
+            group_update_mask
+        ]
+
+        customer_values = _lookup_field(lookup, keys, "customer_name")
+        customer_update_mask = customer_values.ne("")
+        aligned.loc[customer_values.index[customer_update_mask], "customer_name"] = customer_values[
+            customer_update_mask
+        ]
+
+        for fill_only_field in ("eeennn", "strategic_account"):
+            if fill_only_field not in aligned.columns:
+                continue
+            values = _lookup_field(lookup, keys, fill_only_field)
+            blank_mask = aligned.loc[mask, fill_only_field].map(_is_blank_text)
+            update_mask = blank_mask & values.ne("")
+            aligned.loc[values.index[update_mask], fill_only_field] = values[update_mask]
+
+    _apply_lookup(ms_mask, ms_lookup, "_ocn_key")
+    _apply_lookup(ps_mask, ps_lookup, "_emp_key")
+    return aligned.drop(columns=["_ms_ps", "_ocn_key", "_emp_key"], errors="ignore")
+
+
+def _canonicalize_rows_by_actual_identifiers(
+    frame: pd.DataFrame,
+    actual_identifier_lookup: tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]],
+    *,
+    overwrite_dimension_fields: bool = True,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    ms_lookup, ps_lookup = actual_identifier_lookup
+    if not ms_lookup and not ps_lookup:
+        return frame
+
+    mapped = frame.copy()
+    mapped["_ms_ps"] = mapped["ms_ps"].map(_normalize_ms_ps_alias) if "ms_ps" in mapped.columns else ""
+    mapped["_ocn_key"] = (
+        mapped["ocn_number"].map(_normalize_mapping_key)
+        if "ocn_number" in mapped.columns
+        else ""
+    )
+    mapped["_emp_key"] = (
+        mapped["resource_id"].map(_normalize_mapping_key)
+        if "resource_id" in mapped.columns
+        else ""
+    )
+
+    inferred_ms_mask = mapped["_ms_ps"].eq("") & mapped["_ocn_key"].ne("")
+    inferred_ps_mask = mapped["_ms_ps"].eq("") & mapped["_ocn_key"].eq("") & mapped["_emp_key"].ne("")
+    ms_mask = (mapped["_ms_ps"].eq("MS") | inferred_ms_mask) & mapped["_ocn_key"].isin(ms_lookup.keys())
+    ps_mask = (mapped["_ms_ps"].eq("PS") | inferred_ps_mask) & mapped["_emp_key"].isin(ps_lookup.keys())
+
+    name_fields = ("customer_name", "project_name", "resource_name", "client_name")
+    overwrite_fields = (
+        tuple(dict.fromkeys((*name_fields, *OVERVIEW_IDENTIFIER_OVERWRITE_COLUMNS)))
+        if overwrite_dimension_fields
+        else name_fields
+    )
+
+    def _lookup_field(
+        lookup: dict[str, dict[str, str]],
+        keys: pd.Series,
+        field: str,
+    ) -> pd.Series:
+        return keys.map(
+            lambda key: _prefer_text(lookup.get(str(key or ""), {}).get(field))
+        )
+
+    for field in overwrite_fields:
+        if field not in mapped.columns:
+            continue
+        if ms_mask.any():
+            values = _lookup_field(ms_lookup, mapped.loc[ms_mask, "_ocn_key"], field)
+            update_mask = values.ne("")
+            mapped.loc[values.index[update_mask], field] = values[update_mask]
+        if ps_mask.any():
+            values = _lookup_field(ps_lookup, mapped.loc[ps_mask, "_emp_key"], field)
+            update_mask = values.ne("")
+            mapped.loc[values.index[update_mask], field] = values[update_mask]
+
+    for field in OVERVIEW_IDENTIFIER_FILL_ONLY_COLUMNS:
+        if field not in mapped.columns:
+            continue
+        if ms_mask.any():
+            values = _lookup_field(ms_lookup, mapped.loc[ms_mask, "_ocn_key"], field)
+            blank_mask = mapped.loc[ms_mask, field].map(_is_blank_text)
+            update_mask = blank_mask & values.ne("")
+            mapped.loc[values.index[update_mask], field] = values[update_mask]
+        if ps_mask.any():
+            values = _lookup_field(ps_lookup, mapped.loc[ps_mask, "_emp_key"], field)
+            blank_mask = mapped.loc[ps_mask, field].map(_is_blank_text)
+            update_mask = blank_mask & values.ne("")
+            mapped.loc[values.index[update_mask], field] = values[update_mask]
+
+    return mapped.drop(columns=["_ms_ps", "_ocn_key", "_emp_key"], errors="ignore")
+
+
+def _build_actual_dimension_lookup(
+    actual_df: pd.DataFrame,
+) -> tuple[dict[tuple[str, str], dict[str, str]], dict[str, dict[str, str]]]:
+    if actual_df.empty:
+        return {}, {}
+
+    scoped = actual_df.copy()
+    if "customer_name" in scoped.columns:
+        scoped["_customer_key"] = scoped["customer_name"].map(_normalize_mapping_key)
+    else:
+        scoped["_customer_key"] = ""
+    if "project_name" in scoped.columns:
+        scoped["_project_key"] = scoped["project_name"].map(_normalize_mapping_key)
+    else:
+        scoped["_project_key"] = ""
+
+    cp_lookup: dict[tuple[str, str], dict[str, str]] = {}
+    customer_lookup: dict[str, dict[str, str]] = {}
+
+    valid_cp = scoped[
+        scoped["_customer_key"].ne("") & scoped["_project_key"].ne("")
+    ]
+    if not valid_cp.empty:
+        grouped_cp = valid_cp.groupby(["_customer_key", "_project_key"], dropna=False)
+        for (customer_key, project_key), group in grouped_cp:
+            cp_lookup[(str(customer_key), str(project_key))] = {
+                field: _mode_text(group[field]) if field in group.columns else ""
+                for field in OVERVIEW_MAPPING_FILL_COLUMNS
+            }
+
+    valid_customer = scoped[scoped["_customer_key"].ne("")]
+    if not valid_customer.empty:
+        grouped_customer = valid_customer.groupby("_customer_key", dropna=False)
+        for customer_key, group in grouped_customer:
+            customer_lookup[str(customer_key)] = {
+                field: _mode_text(group[field]) if field in group.columns else ""
+                for field in OVERVIEW_MAPPING_FILL_COLUMNS
+            }
+
+    return cp_lookup, customer_lookup
+
+
+def _enrich_frame_from_actual_dimensions(
+    frame: pd.DataFrame,
+    actual_lookup: tuple[dict[tuple[str, str], dict[str, str]], dict[str, dict[str, str]]],
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    cp_lookup, customer_lookup = actual_lookup
+    if not cp_lookup and not customer_lookup:
+        return frame
+
+    enriched = frame.copy()
+    customer_keys = enriched["customer_name"].map(_normalize_mapping_key)
+    project_keys = enriched["project_name"].map(_normalize_mapping_key)
+    composite_keys = list(zip(customer_keys, project_keys))
+
+    for field in OVERVIEW_MAPPING_FILL_COLUMNS:
+        if field not in enriched.columns:
+            continue
+
+        cp_values = pd.Series(
+            [
+                _prefer_text(cp_lookup.get((customer_key, project_key), {}).get(field))
+                if customer_key and project_key
+                else ""
+                for customer_key, project_key in composite_keys
+            ],
+            index=enriched.index,
+        )
+        customer_values = customer_keys.map(
+            lambda key: _prefer_text(customer_lookup.get(str(key or ""), {}).get(field))
+            if key
+            else ""
+        )
+        source_values = cp_values.where(cp_values.ne(""), customer_values)
+        blank_mask = enriched[field].map(_is_blank_text)
+        update_mask = blank_mask & source_values.ne("")
+        enriched.loc[source_values.index[update_mask], field] = source_values[update_mask]
+
+    return enriched
+
+
+def _prepare_mapped_overview_frame(
+    frame: pd.DataFrame,
+    actual_lookup: tuple[dict[tuple[str, str], dict[str, str]], dict[str, dict[str, str]]] | None = None,
+    actual_identifier_lookup: tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]] | None = None,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    mapped = frame.copy()
+    mapped = _canonicalize_ms_rows_by_ocn(mapped)
+    if actual_identifier_lookup is not None:
+        mapped = _canonicalize_rows_by_actual_identifiers(mapped, actual_identifier_lookup)
+    if actual_lookup is not None:
+        mapped = _enrich_frame_from_actual_dimensions(mapped, actual_lookup)
+    return _normalize_overview_frame(mapped)
+
+
+def _normalize_overview_frame(
+    frame: pd.DataFrame,
+    *,
+    infer_ms_ps_from_identifiers: bool = True,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    normalized = frame.copy()
+    for required_column in OVERVIEW_FORECAST_DIMENSION_COLUMNS:
+        if required_column not in normalized.columns:
+            normalized[required_column] = ""
+    for column in [
+        "customer_name",
+        "group_company",
+        "project_name",
+        "resource_name",
+        "ms_ps",
+        "region",
+        "practice_head",
+        "geo_head",
+        "bdm",
+        "entity",
+        "vertical",
+        "deal_type",
+        "business_type",
+        "month",
+        "strategic_account",
+        "eeennn",
+        "ocn_number",
+        "resource_id",
+        "client_name",
+    ]:
+        if column not in normalized.columns:
+            continue
+        normalized[column] = normalized[column].fillna("").astype(str).replace({"nan": ""})
+
+    normalized["ms_ps"] = normalized["ms_ps"].map(_normalize_ms_ps_alias)
+    if infer_ms_ps_from_identifiers and "ocn_number" in normalized.columns and "resource_id" in normalized.columns:
+        ocn_present = normalized["ocn_number"].map(_normalize_mapping_key).ne("")
+        emp_present = normalized["resource_id"].map(_normalize_mapping_key).ne("")
+        missing_ms = normalized["ms_ps"] == ""
+        normalized.loc[missing_ms & ocn_present, "ms_ps"] = "MS"
+        normalized.loc[(normalized["ms_ps"] == "") & emp_present, "ms_ps"] = "PS"
+    if "business_type" in normalized.columns:
+        normalized["business_type"] = normalized["business_type"].map(_normalize_ms_ps_alias)
+        missing_business_type = normalized["business_type"] == ""
+        normalized.loc[missing_business_type, "business_type"] = normalized.loc[missing_business_type, "ms_ps"]
+    normalized["region"] = normalized["region"].map(_normalize_geography_alias)
+    normalized["month"] = normalized["month"].map(_normalize_overview_month)
+    normalized = normalized[normalized["month"].isin(MONTH_LABELS)].copy()
+    normalized["amount"] = pd.to_numeric(normalized["amount"], errors="coerce").fillna(0.0)
+    return normalized
+
+
+def _reconciliation_reference_keys(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype="object")
+
+    ms_ps = (
+        frame["ms_ps"].map(_normalize_ms_ps_alias)
+        if "ms_ps" in frame.columns
+        else pd.Series("", index=frame.index)
+    )
+    ocn_keys = (
+        frame["ocn_number"].map(_normalize_mapping_key)
+        if "ocn_number" in frame.columns
+        else pd.Series("", index=frame.index)
+    )
+    emp_keys = (
+        frame["resource_id"].map(_normalize_mapping_key)
+        if "resource_id" in frame.columns
+        else pd.Series("", index=frame.index)
+    )
+
+    resolved = pd.Series("", index=frame.index, dtype="object")
+    ms_mask = (ms_ps.eq("MS") | (ms_ps.eq("") & ocn_keys.ne(""))) & ocn_keys.ne("")
+    ps_mask = (ms_ps.eq("PS") | (ms_ps.eq("") & ocn_keys.eq("") & emp_keys.ne(""))) & emp_keys.ne("")
+    resolved.loc[ms_mask] = "MS:" + ocn_keys.loc[ms_mask]
+    resolved.loc[ps_mask] = "PS:" + emp_keys.loc[ps_mask]
+    return resolved
+
+
+def _filter_actual_frame_to_budget_references(
+    actual_df: pd.DataFrame,
+    budget_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if actual_df.empty or budget_df.empty:
+        return actual_df
+
+    budget_keys = {
+        str(value)
+        for value in _reconciliation_reference_keys(budget_df).tolist()
+        if str(value)
+    }
+    if not budget_keys:
+        return actual_df
+
+    actual_keys = _reconciliation_reference_keys(actual_df)
+    return actual_df[actual_keys.isin(budget_keys)].copy()
+
+
+def _normalize_filters(raw_filters: dict[str, Any] | None, default_year: str) -> DashboardFilters:
+    payload = dict(raw_filters or {})
+
+    for legacy_key, array_key in LEGACY_TO_ARRAY_FILTER_MAP.items():
+        legacy_value = payload.get(legacy_key)
+        if legacy_value is None:
+            continue
+        if payload.get(array_key):
+            continue
+        payload[array_key] = legacy_value
+
+    financial_years = _normalize_string_list(payload.get("financialYears"))
+    if not financial_years and default_year:
+        financial_years = [default_year]
+
+    period_from = _normalize_period(payload.get("periodFrom"), "Apr")
+    period_to = _normalize_period(payload.get("periodTo"), "Mar")
+    if MONTH_INDEX[period_from] > MONTH_INDEX[period_to]:
+        period_from, period_to = period_to, period_from
+
+    breakdown_dimension = str(payload.get("breakdownDimension") or "").strip() or ""
+    if breakdown_dimension not in PRIMARY_DIMENSION_LABELS:
+        breakdown_dimension = _infer_breakdown_dimension(payload)
+
+    comparison_mode = str(payload.get("comparisonMode") or "absolute").strip().lower()
+    if comparison_mode not in {"absolute", "percentage"}:
+        comparison_mode = "absolute"
+
+    comparison_metric = str(payload.get("comparisonMetric") or "budget_vs_actual").strip().lower()
+    if comparison_metric not in {"budget_vs_actual", "actual_vs_forecast", "budget_vs_forecast"}:
+        comparison_metric = "budget_vs_actual"
+
+    comparison_period = str(payload.get("comparisonPeriod") or "qoq").strip().lower()
+    if comparison_period not in {"qoq", "yoy"}:
+        comparison_period = "qoq"
+
+    return DashboardFilters(
+        financial_years=financial_years,
+        geographies=_normalize_geography_filter_values(
+            _normalize_string_list(payload.get("geographies"))
+        ),
+        practices=_normalize_string_list(payload.get("practices")),
+        geo_heads=_normalize_string_list(payload.get("geoHeads")),
+        bdms=_normalize_string_list(payload.get("bdms")),
+        entities=_normalize_string_list(payload.get("entities")),
+        verticals=_normalize_string_list(payload.get("verticals")),
+        accounts=_normalize_string_list(payload.get("accounts")),
+        projects=_normalize_string_list(
+            payload.get("projectNames") or payload.get("projects")
+        ),
+        strategic_accounts=_normalize_string_list(payload.get("strategicAccounts")),
+        deal_types=_normalize_string_list(payload.get("dealTypes")),
+        business_types=_normalize_string_list(payload.get("businessTypes")),
+        eeennns=_normalize_string_list(payload.get("eeennns")),
+        period_from=period_from,
+        period_to=period_to,
+        comparison_mode=comparison_mode,
+        comparison_metric=comparison_metric,
+        comparison_period=comparison_period,
+        compare_previous=_normalize_bool(payload.get("comparePrevious")),
+        breakdown_dimension=breakdown_dimension,
+        what_if_pct=_normalize_float(payload.get("whatIfPct")),
+    )
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple, set)) else [value]
+    normalized: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if not text or text.upper() == "ALL":
+            continue
+        normalized.append(text)
+    return list(dict.fromkeys(normalized))
+
+
+def _normalize_period(value: Any, fallback: str) -> str:
+    text = str(value or "").strip()
+    return text if text in MONTH_INDEX else fallback
+
+
+def _normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_float(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-50.0, min(50.0, numeric))
+
+
+def _normalize_overview_month(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = text[:3].title()
+    return normalized if normalized in MONTH_INDEX else ""
+
+
+def _normalize_ms_ps_alias(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    upper_text = text.upper()
+    compact = upper_text.replace(" ", "").replace("-", "").replace("/", "")
+    if compact.startswith("MS") or "MANAGEDSERVICE" in compact or compact == "MANAGED":
+        return "MS"
+    if compact.startswith("PS") or "PROFESSIONALSERVICE" in compact or compact.startswith("PROFESSIONAL"):
+        return "PS"
+    return upper_text
+
+
+def _normalize_geography_alias(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    compact = text.upper().replace("_", " ").replace("-", " ")
+    compact = " ".join(compact.split())
+    if compact in US_GEOGRAPHY_ALIASES:
+        return "USA"
+    if compact in ROW_GEOGRAPHY_ALIASES:
+        return "ROW"
+    return text
+
+
+def _normalize_geography_filter_values(values: list[str]) -> list[str]:
+    if not values:
+        return []
+    normalized = [_normalize_geography_alias(value) for value in values]
+    return list(dict.fromkeys(value for value in normalized if value))
+
+
+def _infer_breakdown_dimension(payload: dict[str, Any]) -> str:
+    if _normalize_string_list(payload.get("accounts")):
+        return "customer_name"
+    if _normalize_string_list(payload.get("bdms")):
+        return "customer_name"
+    if _normalize_string_list(payload.get("practices")):
+        return "bdm"
+    if _normalize_string_list(payload.get("geographies")):
+        return "practice_head"
+    return "region"
+
+def _apply_filters(frame: pd.DataFrame, filters: DashboardFilters) -> pd.DataFrame:
+    filtered = frame.copy()
+    filter_values = {
+        "region": filters.geographies,
+        "practice_head": filters.practices,
+        "geo_head": filters.geo_heads,
+        "bdm": filters.bdms,
+        "entity": filters.entities,
+        "vertical": filters.verticals,
+        "customer_name": filters.accounts,
+        "project_name": filters.projects,
+        "strategic_account": filters.strategic_accounts,
+        "deal_type": filters.deal_types,
+        "business_type": filters.business_types,
+        "eeennn": filters.eeennns,
+    }
+
+    scoped_masks: list[tuple[pd.Series, bool]] = []
+
+    for column, values in filter_values.items():
+        if not values:
+            continue
+        if column not in filtered.columns:
+            continue
+        normalized_values = {
+            str(value).strip().lower()
+            for value in values
+            if str(value).strip()
+        }
+        if not normalized_values:
+            continue
+        column_values = filtered[column].fillna("").astype(str).str.strip().str.lower()
+        scoped_mask = column_values.isin(normalized_values)
+        scoped_masks.append((scoped_mask, bool(scoped_mask.any())))
+
+    if not scoped_masks:
+        return filtered
+
+    if not any(has_match for _, has_match in scoped_masks):
+        return filtered.iloc[0:0]
+
+    for scoped_mask, has_match in scoped_masks:
+        if not has_match:
+            continue
+        filtered = filtered[scoped_mask]
+
+    return filtered
+
+
+def _read_forecast_month_values(
+    forecast_df: pd.DataFrame,
+    month: str,
+) -> tuple[float, float, float]:
+    if forecast_df.empty:
+        return 0.0, 0.0, 0.0
+
+    if "month" in forecast_df.columns and "amount" in forecast_df.columns:
+        forecast_rows = forecast_df[forecast_df["month"] == month]
+        if forecast_rows.empty:
+            return 0.0, 0.0, 0.0
+        return (
+            float(forecast_rows["amount"].sum()),
+            float(forecast_rows.loc[forecast_rows["ms_ps"] == "MS", "amount"].sum()),
+            float(forecast_rows.loc[forecast_rows["ms_ps"] == "PS", "amount"].sum()),
+        )
+
+    forecast_column = OVERVIEW_FORECAST_MONTH_COLUMNS[month]
+    return (
+        float(forecast_df[forecast_column].sum()),
+        float(forecast_df.loc[forecast_df["ms_ps"] == "MS", forecast_column].sum()),
+        float(forecast_df.loc[forecast_df["ms_ps"] == "PS", forecast_column].sum()),
+    )
+
+
+def _build_overview_monthly_series(
+    budget_df: pd.DataFrame,
+    actual_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    monthly_rows: list[dict[str, Any]] = []
+
+    for month in MONTH_LABELS:
+        budget_rows = budget_df[budget_df["month"] == month] if not budget_df.empty else budget_df
+        actual_rows = actual_df[actual_df["month"] == month] if not actual_df.empty else actual_df
+
+        forecast_total, forecast_ms, forecast_ps = _read_forecast_month_values(
+            forecast_df,
+            month,
+        )
+
+        budget_total = float(budget_rows["amount"].sum()) if not budget_rows.empty else 0.0
+        actual_total = float(actual_rows["amount"].sum()) if not actual_rows.empty else 0.0
+        budget_ms = float(
+            budget_rows.loc[budget_rows["ms_ps"] == "MS", "amount"].sum()
+        ) if not budget_rows.empty else 0.0
+        budget_ps = float(
+            budget_rows.loc[budget_rows["ms_ps"] == "PS", "amount"].sum()
+        ) if not budget_rows.empty else 0.0
+        actual_ms = float(
+            actual_rows.loc[actual_rows["ms_ps"] == "MS", "amount"].sum()
+        ) if not actual_rows.empty else 0.0
+        actual_ps = float(
+            actual_rows.loc[actual_rows["ms_ps"] == "PS", "amount"].sum()
+        ) if not actual_rows.empty else 0.0
+        if forecast_total == 0 and budget_total != 0:
+            forecast_total = budget_total
+            forecast_ms = budget_ms
+            forecast_ps = budget_ps
+
+        monthly_rows.append(
+            {
+                "month": month,
+                "monthIndex": MONTH_INDEX[month],
+                "quarter": MONTH_TO_QUARTER[month],
+                "budget": budget_total,
+                "budgetMs": budget_ms,
+                "budgetPs": budget_ps,
+                "forecast": forecast_total,
+                "forecastMs": forecast_ms,
+                "forecastPs": forecast_ps,
+                "actual": actual_total,
+                "actualMs": actual_ms,
+                "actualPs": actual_ps,
+                "variance": actual_total - budget_total,
+            }
+        )
+
+    return monthly_rows
+
+
+def _build_overview_summary(
+    budget_df: pd.DataFrame,
+    actual_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    monthly_series: list[dict[str, Any]],
+) -> dict[str, Any]:
+    unique_customers: set[str] = set()
+    unique_projects: set[str] = set()
+    unique_resources: set[str] = set()
+    has_unassigned_group_company = False
+
+    # Active customers are budget-driven (Updated Customer / Group Company),
+    # with a fallback to other frames only when budget data is unavailable.
+    customer_source_frames = [budget_df] if not budget_df.empty else [actual_df, forecast_df]
+    for frame in customer_source_frames:
+        if frame.empty:
+            continue
+        group_values = frame["group_company"].tolist() if "group_company" in frame.columns else []
+        customer_values = frame["customer_name"].tolist() if "customer_name" in frame.columns else []
+        for group_value, customer_value in zip(group_values, customer_values):
+            normalized_group = str(group_value).strip()
+            normalized_customer = str(customer_value).strip()
+            if normalized_group:
+                unique_customers.add(normalized_group)
+            elif normalized_customer:
+                has_unassigned_group_company = True
+    if not unique_customers:
+        for frame in customer_source_frames:
+            if frame.empty or "customer_name" not in frame.columns:
+                continue
+            for customer_value in frame["customer_name"].tolist():
+                canonical_customer = str(customer_value).strip()
+                if canonical_customer:
+                    unique_customers.add(canonical_customer)
+
+    for frame in (budget_df, actual_df, forecast_df):
+        if frame.empty:
+            continue
+        unique_projects.update(
+            str(value).strip()
+            for value in frame["project_name"].tolist()
+            if str(value).strip()
+        )
+        unique_resources.update(
+            str(value).strip()
+            for value in frame["resource_name"].tolist()
+            if str(value).strip()
+        )
+
+    total_budget = sum(float(row["budget"]) for row in monthly_series)
+    total_forecast = sum(float(row["forecast"]) for row in monthly_series)
+    total_actual = sum(float(row["actual"]) for row in monthly_series)
+    customer_count = len(unique_customers)
+    if unique_customers and has_unassigned_group_company:
+        customer_count += 1
+
+    return {
+        "rowCount": int(len(budget_df) + len(actual_df)),
+        "resourceCount": len(unique_resources),
+        "customerCount": customer_count,
+        "projectCount": len(unique_projects),
+        "totalBudget": total_budget,
+        "totalOutlook": total_forecast,
+        "totalActual": total_actual,
+        "totalVariance": total_actual - total_budget,
+        "totalsByMsps": {
+            "budget": {
+                "ms": sum(float(row["budgetMs"]) for row in monthly_series),
+                "ps": sum(float(row["budgetPs"]) for row in monthly_series),
+            },
+            "forecast": {
+                "ms": sum(float(row["forecastMs"]) for row in monthly_series),
+                "ps": sum(float(row["forecastPs"]) for row in monthly_series),
+            },
+            "actual": {
+                "ms": sum(float(row["actualMs"]) for row in monthly_series),
+                "ps": sum(float(row["actualPs"]) for row in monthly_series),
+            },
+        },
+    }
+
+
+def _build_filter_options(frame: pd.DataFrame, filters: DashboardFilters) -> dict[str, Any]:
+    current_frame = _apply_filters(frame, filters)
+    option_frame = current_frame if not current_frame.empty else frame
+
+    def unique_values(column: str) -> list[str]:
+        if column not in option_frame.columns:
+            return []
+        return _sorted_unique(option_frame[column])
+
+    return {
+        "financialYears": unique_values("financial_year"),
+        "regions": unique_values("region"),
+        "practiceHeads": unique_values("practice_head"),
+        "geoHeads": unique_values("geo_head"),
+        "entities": unique_values("entity"),
+        "verticals": unique_values("vertical"),
+        "customerNames": unique_values("customer_name"),
+        "strategicAccounts": unique_values("strategic_account"),
+        "dealTypes": unique_values("deal_type"),
+        "businessTypes": unique_values("business_type"),
+        "eeennns": unique_values("eeennn"),
+        "bdms": unique_values("bdm"),
+        "accounts": unique_values("customer_name"),
+        "periods": MONTH_LABELS,
+    }
+
+
+def _sorted_unique(series: pd.Series) -> list[str]:
+    if series.empty:
+        return []
+    return sorted(
+        {
+            str(value).strip()
+            for value in series.fillna("").tolist()
+            if str(value).strip()
+        }
+    )
+
+
+def _select_latest_upload(uploads_df: pd.DataFrame, selected_years: list[str]) -> dict[str, Any] | None:
+    scoped = uploads_df
+    if selected_years:
+        scoped = scoped[scoped["financial_year"].isin(selected_years)]
+    if scoped.empty:
+        return None
+    return scoped.sort_values("uploaded_at", ascending=False).iloc[0].to_dict()
+
+
+def _build_monthly_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+
+    for record in frame.to_dict(orient="records"):
+        for index, (label, budget_key, forecast_key, actual_key, variance_key) in enumerate(MONTH_SEQUENCE):
+            normalized_msps = str(record.get("ms_ps") or "").strip().upper()
+            rows.append(
+                {
+                    "financial_year": record["financial_year"],
+                    "month": label,
+                    "month_index": index,
+                    "quarter": MONTH_TO_QUARTER[label],
+                    "region": record.get("region", "") or "",
+                    "practice_head": record.get("practice_head", "") or "",
+                    "geo_head": record.get("geo_head", "") or "",
+                    "bdm": record.get("bdm", "") or "",
+                    "entity": record.get("entity", "") or "",
+                    "vertical": record.get("vertical", "") or "",
+                    "customer_name": record.get("customer_name", "") or "",
+                    "group_company": (record.get("group_company", "") or record.get("gr_entity", "") or ""),
+                    "customer_dimension": (
+                        record.get("group_company", "")
+                        or record.get("gr_entity", "")
+                        or record.get("customer_name", "")
+                        or ""
+                    ),
+                    "project_name": record.get("project_name", "") or "",
+                    "resource_id": record.get("resource_id", "") or "",
+                    "resource_name": record.get("resource_name", "") or "",
+                    "deal_type": record.get("deal_type", "") or "",
+                    "business_type": record.get("business_type", "") or "",
+                    "ms_ps": normalized_msps if normalized_msps in {"MS", "PS"} else "",
+                    "budget": float(record.get(budget_key) or 0.0),
+                    "forecast": float(record.get(budget_key) or 0.0),
+                    "actual": float(record.get(actual_key) or 0.0) if actual_key else 0.0,
+                    "variance": float(record.get(variance_key) or 0.0) if variance_key else 0.0,
+                    "bill_rate": float(record.get("bill_rate") or 0.0),
+                    "start_date": record.get("start_date"),
+                    "end_date": record.get("end_date"),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def _filter_month_window(frame: pd.DataFrame, period_from: str, period_to: str) -> pd.DataFrame:
+    start_index = MONTH_INDEX[period_from]
+    end_index = MONTH_INDEX[period_to]
+    return frame[(frame["month_index"] >= start_index) & (frame["month_index"] <= end_index)].copy()
+
+
+def _build_summary(duck: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+    records_df = duck.sql(
+        """
+        select
+            count(*) as row_count,
+            count(distinct nullif(resource_id, '')) as resource_count,
+            count(distinct nullif(group_company, ''))
+                + case
+                    when count(*) filter (
+                        where nullif(group_company, '') is null
+                          and nullif(customer_name, '') is not null
+                    ) > 0
+                    then 1
+                    else 0
+                  end as customer_count,
+            count(distinct nullif(project_name, '')) as project_count
+        from records
+        """
+    ).df()
+    monthly_df = duck.sql(
+        """
+        select
+            coalesce(sum(budget), 0) as total_budget,
+            coalesce(sum(forecast), 0) as total_outlook,
+            coalesce(sum(actual), 0) as total_actual,
+            coalesce(sum(variance), 0) as total_variance
+        from monthly
+        """
+    ).df()
+
+    records_row = records_df.iloc[0]
+    monthly_row = monthly_df.iloc[0]
+    msps_df = duck.sql(
+        """
+        select
+            coalesce(sum(case when ms_ps = 'MS' then budget else 0 end), 0) as budget_ms,
+            coalesce(sum(case when ms_ps = 'PS' then budget else 0 end), 0) as budget_ps,
+            coalesce(sum(case when ms_ps = 'MS' then forecast else 0 end), 0) as forecast_ms,
+            coalesce(sum(case when ms_ps = 'PS' then forecast else 0 end), 0) as forecast_ps,
+            coalesce(sum(case when ms_ps = 'MS' then actual else 0 end), 0) as actual_ms,
+            coalesce(sum(case when ms_ps = 'PS' then actual else 0 end), 0) as actual_ps
+        from monthly
+        """
+    ).df()
+    msps_row = msps_df.iloc[0]
+
+    return {
+        "rowCount": int(records_row["row_count"]),
+        "resourceCount": int(records_row["resource_count"]),
+        "customerCount": int(records_row["customer_count"]),
+        "projectCount": int(records_row["project_count"]),
+        "totalBudget": _to_float(monthly_row["total_budget"]),
+        "totalOutlook": _to_float(monthly_row["total_outlook"]),
+        "totalActual": _to_float(monthly_row["total_actual"]),
+        "totalVariance": _to_float(monthly_row["total_variance"]),
+        "totalsByMsps": {
+            "budget": {
+                "ms": _to_float(msps_row["budget_ms"]),
+                "ps": _to_float(msps_row["budget_ps"]),
+            },
+            "forecast": {
+                "ms": _to_float(msps_row["forecast_ms"]),
+                "ps": _to_float(msps_row["forecast_ps"]),
+            },
+            "actual": {
+                "ms": _to_float(msps_row["actual_ms"]),
+                "ps": _to_float(msps_row["actual_ps"]),
+            },
+        },
+    }
+
+
+def _build_trend_series(duck: duckdb.DuckDBPyConnection, normalized: DashboardFilters) -> list[dict[str, Any]]:
+    trend_df = duck.sql(
+        """
+        select
+            month,
+            month_index,
+            quarter,
+            coalesce(sum(budget), 0) as budget,
+            coalesce(sum(case when ms_ps = 'MS' then budget else 0 end), 0) as budget_ms,
+            coalesce(sum(case when ms_ps = 'PS' then budget else 0 end), 0) as budget_ps,
+            coalesce(sum(forecast), 0) as forecast,
+            coalesce(sum(case when ms_ps = 'MS' then forecast else 0 end), 0) as forecast_ms,
+            coalesce(sum(case when ms_ps = 'PS' then forecast else 0 end), 0) as forecast_ps,
+            coalesce(sum(actual), 0) as actual,
+            coalesce(sum(case when ms_ps = 'MS' then actual else 0 end), 0) as actual_ms,
+            coalesce(sum(case when ms_ps = 'PS' then actual else 0 end), 0) as actual_ps,
+            coalesce(sum(variance), 0) as variance
+        from monthly
+        group by 1, 2, 3
+        order by month_index
+        """
+    ).df()
+
+    if trend_df.empty:
+        return []
+
+    average_band = max(float(trend_df["variance"].abs().mean()), 0.05 * max(float(trend_df["forecast"].max()), 1.0))
+    actual_delta = trend_df["actual"].diff().fillna(0.0)
+    anomaly_threshold = max(float(actual_delta.abs().std(ddof=0)) * 1.35, float(trend_df["actual"].mean()) * 0.12)
+
+    if normalized.what_if_pct:
+        factor = 1 + normalized.what_if_pct / 100
+        trend_df["forecast"] = trend_df["forecast"] * factor
+        trend_df["variance"] = trend_df["forecast"] - trend_df["actual"]
+
+    rows: list[dict[str, Any]] = []
+    for index, row in trend_df.iterrows():
+        anomaly = bool(abs(actual_delta.iloc[index]) >= anomaly_threshold and row["actual"] > 0)
+        forecast = _to_float(row["forecast"])
+        rows.append(
+            {
+                "month": str(row["month"]),
+                "quarter": str(row["quarter"]),
+                "budget": _to_float(row["budget"]),
+                "budgetMs": _to_float(row["budget_ms"]),
+                "budgetPs": _to_float(row["budget_ps"]),
+                "forecast": forecast,
+                "forecastMs": _to_float(row["forecast_ms"]),
+                "forecastPs": _to_float(row["forecast_ps"]),
+                "forecastLow": max(0.0, forecast - average_band),
+                "forecastHigh": forecast + average_band,
+                "actual": _to_float(row["actual"]),
+                "actualMs": _to_float(row["actual_ms"]),
+                "actualPs": _to_float(row["actual_ps"]),
+                "variance": _to_float(row["variance"]),
+                "variancePct": _safe_pct(_to_float(row["variance"]), _to_float(row["budget"])),
+                "anomaly": anomaly,
+            }
+        )
+    return rows
+
+
+def _build_variance_bars(trend_series: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "month": row["month"],
+            "variance": row["variance"],
+            "variancePct": row["variancePct"],
+            "tone": "positive" if row["variance"] >= 0 else "negative",
+        }
+        for row in trend_series
+    ]
+
+
+def _build_contribution(duck: duckdb.DuckDBPyConnection, normalized: DashboardFilters) -> dict[str, Any]:
+    dimension = normalized.breakdown_dimension
+    dimension_label = PRIMARY_DIMENSION_LABELS[dimension]
+    breakdown_df = duck.sql(
+        f"""
+        select
+            coalesce(nullif({dimension}, ''), 'Unassigned') as label,
+            coalesce(sum(budget), 0) as budget,
+            coalesce(sum(forecast), 0) as forecast,
+            coalesce(sum(actual), 0) as actual,
+            coalesce(sum(variance), 0) as variance
+        from monthly
+        group by 1
+        order by actual desc, label asc
+        limit 10
+        """
+    ).df()
+
+    total_actual = float(breakdown_df["actual"].sum()) if not breakdown_df.empty else 0.0
+    rows = [
+        {
+            "label": str(row["label"]),
+            "budget": _to_float(row["budget"]),
+            "forecast": _to_float(row["forecast"]),
+            "actual": _to_float(row["actual"]),
+            "variance": _to_float(row["variance"]),
+            "contributionPct": _safe_pct(_to_float(row["actual"]), total_actual),
+        }
+        for _, row in breakdown_df.iterrows()
+    ]
+
+    return {
+        "dimension": dimension,
+        "dimensionLabel": dimension_label,
+        "rows": rows,
+    }
+
+
+def _build_heatmap(duck: duckdb.DuckDBPyConnection, normalized: DashboardFilters) -> dict[str, Any]:
+    dimension = normalized.breakdown_dimension
+    label_df = duck.sql(
+        f"""
+        select
+            coalesce(nullif({dimension}, ''), 'Unassigned') as label,
+            coalesce(sum(actual), 0) as total_actual
+        from monthly
+        group by 1
+        order by abs(total_actual) desc, label asc
+        limit 8
+        """
+    ).df()
+
+    labels = label_df["label"].tolist()
+    if not labels:
+        return {
+            "dimension": dimension,
+            "xLabels": MONTH_LABELS,
+            "yLabels": [],
+            "cells": [],
+            "metric": "actual",
+        }
+
+    quoted_labels = "', '".join(label.replace("'", "''") for label in labels)
+    heat_df = duck.sql(
+        f"""
+        select
+            coalesce(nullif({dimension}, ''), 'Unassigned') as label,
+            month,
+            month_index,
+            coalesce(sum(actual), 0) as actual,
+            coalesce(sum(variance), 0) as variance
+        from monthly
+        where coalesce(nullif({dimension}, ''), 'Unassigned') in ('{quoted_labels}')
+        group by 1, 2, 3
+        order by label asc, month_index asc
+        """
+    ).df()
+
+    max_value = max([abs(_to_float(value)) for value in heat_df["variance"].tolist()] or [1.0])
+    cells = [
+        {
+            "x": str(row["month"]),
+            "y": str(row["label"]),
+            "value": _to_float(row["variance"]),
+            "actual": _to_float(row["actual"]),
+            "intensity": abs(_to_float(row["variance"])) / max_value if max_value else 0.0,
+        }
+        for _, row in heat_df.iterrows()
+    ]
+
+    return {
+        "dimension": dimension,
+        "xLabels": MONTH_LABELS[MONTH_INDEX[normalized.period_from] : MONTH_INDEX[normalized.period_to] + 1],
+        "yLabels": labels,
+        "cells": cells,
+        "metric": "variance",
+    }
+
+def _build_performers(duck: duckdb.DuckDBPyConnection, normalized: DashboardFilters) -> dict[str, Any]:
+    dimension = normalized.breakdown_dimension
+    performer_df = duck.sql(
+        f"""
+        select
+            coalesce(nullif({dimension}, ''), 'Unassigned') as label,
+            max(region) as region,
+            max(practice_head) as practice_head,
+            max(bdm) as bdm,
+            max(customer_name) as customer_name,
+            coalesce(sum(budget), 0) as budget,
+            coalesce(sum(forecast), 0) as forecast,
+            coalesce(sum(actual), 0) as actual,
+            coalesce(sum(variance), 0) as variance
+        from monthly
+        group by 1
+        order by variance desc, actual desc
+        limit 24
+        """
+    ).df()
+
+    spark_df = duck.sql(
+        f"""
+        select
+            coalesce(nullif({dimension}, ''), 'Unassigned') as label,
+            month_index,
+            coalesce(sum(actual), 0) as actual
+        from monthly
+        group by 1, 2
+        order by label asc, month_index asc
+        """
+    ).df()
+
+    spark_map: dict[str, list[float]] = {}
+    for _, row in spark_df.iterrows():
+        label = str(row["label"])
+        spark_map.setdefault(label, []).append(_to_float(row["actual"]))
+
+    rows = [
+        {
+            "label": str(row["label"]),
+            "region": str(row["region"] or "Unassigned"),
+            "practiceHead": str(row["practice_head"] or "Unassigned"),
+            "bdm": str(row["bdm"] or "Unassigned"),
+            "account": str(row["customer_name"] or "Unassigned"),
+            "budget": _to_float(row["budget"]),
+            "forecast": _to_float(row["forecast"]),
+            "actual": _to_float(row["actual"]),
+            "variance": _to_float(row["variance"]),
+            "variancePct": _safe_pct(_to_float(row["variance"]), _to_float(row["budget"])),
+            "sparkline": spark_map.get(str(row["label"]), []),
+            "tone": "positive" if _to_float(row["variance"]) >= 0 else "negative",
+        }
+        for _, row in performer_df.iterrows()
+    ]
+
+    return {
+        "dimension": dimension,
+        "rows": rows,
+    }
+
+
+def _build_resource_table(duck: duckdb.DuckDBPyConnection) -> list[dict[str, Any]]:
+    resource_df = duck.sql(
+        """
+        select *
+        from (
+            select
+                coalesce(resource_id, '') as resource_id,
+                coalesce(nullif(resource_name, ''), 'Unnamed resource') as resource_name,
+                max(customer_name) as customer_name,
+                max(project_name) as project_name,
+                max(region) as region,
+                max(practice_head) as practice_head,
+                max(geo_head) as geo_head,
+                max(bill_rate) as bill_rate,
+                min(start_date) as start_date,
+                max(end_date) as end_date,
+                coalesce(sum(budget), 0) as budget,
+                coalesce(sum(forecast), 0) as outlook,
+                coalesce(sum(variance), 0) as variance
+            from monthly
+            group by 1, 2
+        ) resource_rollup
+        order by abs(variance) desc, outlook desc
+        limit 24
+        """
+    ).df()
+
+    return [
+        {
+            "resourceId": str(row["resource_id"]),
+            "resourceName": str(row["resource_name"]),
+            "customerName": str(row["customer_name"] or "Unassigned"),
+            "projectName": str(row["project_name"] or "Unassigned"),
+            "region": str(row["region"] or "Unassigned"),
+            "practiceHead": str(row["practice_head"] or "Unassigned"),
+            "geoHead": str(row["geo_head"] or "Unassigned"),
+            "billRate": _to_float(row["bill_rate"]),
+            "startDate": _serialize_date(row["start_date"]),
+            "endDate": _serialize_date(row["end_date"]),
+            "budget": _to_float(row["budget"]),
+            "outlook": _to_float(row["outlook"]),
+            "variance": _to_float(row["variance"]),
+        }
+        for _, row in resource_df.iterrows()
+    ]
+
+
+def _build_breakdown(duck: duckdb.DuckDBPyConnection, column: str) -> list[dict[str, Any]]:
+    breakdown_df = duck.sql(
+        f"""
+        select
+            coalesce(nullif({column}, ''), 'Unassigned') as label,
+            coalesce(sum(budget), 0) as budget,
+            coalesce(sum(forecast), 0) as outlook,
+            coalesce(sum(actual), 0) as actual,
+            coalesce(sum(variance), 0) as variance
+        from monthly
+        group by 1
+        order by outlook desc, label asc
+        limit 8
+        """
+    ).df()
+
+    return [
+        {
+            "label": str(row["label"]),
+            "budget": _to_float(row["budget"]),
+            "outlook": _to_float(row["outlook"]),
+            "actual": _to_float(row["actual"]),
+            "variance": _to_float(row["variance"]),
+        }
+        for _, row in breakdown_df.iterrows()
+    ]
+
+
+def _build_comparison_summary(
+    all_records_df: pd.DataFrame,
+    filtered_records_df: pd.DataFrame,
+    uploads_df: pd.DataFrame,
+    normalized: DashboardFilters,
+    current_monthly_df: pd.DataFrame,
+) -> dict[str, Any]:
+    current_budget = _to_float(current_monthly_df["budget"].sum())
+    current_forecast = _to_float(current_monthly_df["forecast"].sum())
+    current_actual = _to_float(current_monthly_df["actual"].sum())
+
+    baseline_value = current_budget
+    current_value = current_actual
+    label = "Budget vs Actual"
+
+    if normalized.comparison_metric == "actual_vs_forecast":
+        baseline_value = current_forecast
+        current_value = current_actual
+        label = "Actual vs Forecast"
+    elif normalized.comparison_metric == "budget_vs_forecast":
+        baseline_value = current_budget
+        current_value = current_forecast
+        label = "Budget vs Forecast"
+
+    delta = current_value - baseline_value
+    previous_value: float | None = None
+    previous_delta: float | None = None
+    previous_label: str | None = None
+
+    if normalized.compare_previous:
+        previous_period_label, previous_monthly = _resolve_previous_period(
+            all_records_df=all_records_df,
+            filtered_records_df=filtered_records_df,
+            uploads_df=uploads_df,
+            normalized=normalized,
+        )
+        previous_label = previous_period_label
+        if previous_monthly is not None and not previous_monthly.empty:
+            prev_budget = _to_float(previous_monthly["budget"].sum())
+            prev_forecast = _to_float(previous_monthly["forecast"].sum())
+            prev_actual = _to_float(previous_monthly["actual"].sum())
+
+            if normalized.comparison_metric == "actual_vs_forecast":
+                previous_value = prev_actual
+                previous_delta = prev_actual - prev_forecast
+            elif normalized.comparison_metric == "budget_vs_forecast":
+                previous_value = prev_forecast
+                previous_delta = prev_forecast - prev_budget
+            else:
+                previous_value = prev_actual
+                previous_delta = prev_actual - prev_budget
+
+    return {
+        "label": label,
+        "mode": normalized.comparison_mode,
+        "period": normalized.comparison_period,
+        "currentValue": current_value,
+        "baselineValue": baseline_value,
+        "delta": delta,
+        "deltaPct": _safe_pct(delta, baseline_value),
+        "previousValue": previous_value,
+        "previousDelta": previous_delta,
+        "previousLabel": previous_label,
+    }
+
+
+def _resolve_previous_period(
+    all_records_df: pd.DataFrame,
+    filtered_records_df: pd.DataFrame,
+    uploads_df: pd.DataFrame,
+    normalized: DashboardFilters,
+) -> tuple[str | None, pd.DataFrame | None]:
+    start_index = MONTH_INDEX[normalized.period_from]
+    end_index = MONTH_INDEX[normalized.period_to]
+    window_length = end_index - start_index + 1
+
+    if normalized.comparison_period == "yoy" and normalized.financial_years:
+        anchor_year = normalized.financial_years[0]
+        previous_year = _previous_financial_year(anchor_year)
+        if not previous_year:
+            return None, None
+        scoped = all_records_df[all_records_df["financial_year"] == previous_year]
+        latest_year_upload = _select_latest_upload(uploads_df, [previous_year])
+        if scoped.empty:
+            return previous_year, None
+        temp_filters = DashboardFilters(
+            financial_years=[previous_year],
+            geographies=normalized.geographies,
+            practices=normalized.practices,
+            geo_heads=normalized.geo_heads,
+            bdms=normalized.bdms,
+            entities=normalized.entities,
+            verticals=normalized.verticals,
+            accounts=normalized.accounts,
+            projects=normalized.projects,
+            strategic_accounts=normalized.strategic_accounts,
+            deal_types=normalized.deal_types,
+            business_types=normalized.business_types,
+            eeennns=normalized.eeennns,
+            period_from=normalized.period_from,
+            period_to=normalized.period_to,
+            comparison_mode=normalized.comparison_mode,
+            comparison_metric=normalized.comparison_metric,
+            comparison_period=normalized.comparison_period,
+            compare_previous=False,
+            breakdown_dimension=normalized.breakdown_dimension,
+            what_if_pct=0.0,
+        )
+        scoped = _apply_filters(scoped, temp_filters)
+        if scoped.empty:
+            return latest_year_upload["financial_year"] if latest_year_upload else previous_year, None
+        monthly = _filter_month_window(_build_monthly_frame(scoped), normalized.period_from, normalized.period_to)
+        return previous_year, monthly
+
+    prev_start = max(0, start_index - window_length)
+    prev_end = max(prev_start, start_index - 1)
+    if start_index == 0:
+        return None, None
+
+    monthly = _build_monthly_frame(filtered_records_df)
+    previous = monthly[(monthly["month_index"] >= prev_start) & (monthly["month_index"] <= prev_end)].copy()
+    if previous.empty:
+        return None, None
+
+    return f"{MONTH_LABELS[prev_start]}-{MONTH_LABELS[prev_end]}", previous
+
+
+def _previous_financial_year(financial_year: str) -> str | None:
+    try:
+        start_text, end_text = financial_year.split("-", 1)
+        start_year = int(start_text)
+        end_year = int(end_text)
+    except ValueError:
+        return None
+    return f"{start_year - 1}-{end_year - 1}"
+
+def _build_waterfall(
+    duck: duckdb.DuckDBPyConnection,
+    summary: dict[str, Any],
+    normalized: DashboardFilters,
+) -> dict[str, Any]:
+    dimension = normalized.breakdown_dimension
+    metric_expression = "actual - budget"
+    start_total = summary["totalBudget"]
+    end_total = summary["totalActual"]
+    if normalized.comparison_metric == "actual_vs_forecast":
+        metric_expression = "actual - forecast"
+        start_total = summary["totalOutlook"]
+        end_total = summary["totalActual"]
+    elif normalized.comparison_metric == "budget_vs_forecast":
+        metric_expression = "forecast - budget"
+        start_total = summary["totalBudget"]
+        end_total = summary["totalOutlook"]
+
+    driver_df = duck.sql(
+        f"""
+        select
+            coalesce(nullif({dimension}, ''), 'Unassigned') as label,
+            coalesce(sum({metric_expression}), 0) as delta
+        from monthly
+        group by 1
+        order by abs(delta) desc, label asc
+        limit 6
+        """
+    ).df()
+
+    residual = end_total - start_total - _to_float(driver_df["delta"].sum() if not driver_df.empty else 0.0)
+    steps: list[dict[str, Any]] = [
+        {
+            "label": "Starting point",
+            "value": start_total,
+            "start": 0.0,
+            "end": start_total,
+            "type": "total",
+        }
+    ]
+
+    running = start_total
+    for _, row in driver_df.iterrows():
+        delta = _to_float(row["delta"])
+        steps.append(
+            {
+                "label": str(row["label"]),
+                "value": delta,
+                "start": running,
+                "end": running + delta,
+                "type": "increase" if delta >= 0 else "decrease",
+            }
+        )
+        running += delta
+
+    if abs(residual) >= 0.01:
+        steps.append(
+            {
+                "label": "Other drivers",
+                "value": residual,
+                "start": running,
+                "end": running + residual,
+                "type": "increase" if residual >= 0 else "decrease",
+            }
+        )
+
+    steps.append(
+        {
+            "label": "Current outcome",
+            "value": end_total,
+            "start": 0.0,
+            "end": end_total,
+            "type": "total",
+        }
+    )
+
+    return {
+        "metric": normalized.comparison_metric,
+        "steps": steps,
+    }
+
+
+def _build_side_by_side(frame: pd.DataFrame, normalized: DashboardFilters) -> dict[str, Any] | None:
+    if frame.empty or "bdm" not in frame:
+        return None
+
+    monthly = _filter_month_window(_build_monthly_frame(frame), normalized.period_from, normalized.period_to)
+    bdm_totals = monthly.groupby("bdm", dropna=False)["actual"].sum().sort_values(ascending=False)
+    labels = [label for label in bdm_totals.index.tolist() if str(label).strip()]
+    labels = normalized.bdms[:2] if len(normalized.bdms) >= 2 else labels[:2]
+
+    if len(labels) < 2:
+        return None
+
+    panels: list[dict[str, Any]] = []
+    for label in labels:
+        scoped = monthly[monthly["bdm"] == label]
+        sparkline = (
+            scoped.groupby("month_index")["actual"]
+            .sum()
+            .reindex(range(MONTH_INDEX[normalized.period_from], MONTH_INDEX[normalized.period_to] + 1), fill_value=0.0)
+            .tolist()
+        )
+        panels.append(
+            {
+                "label": label,
+                "actual": _to_float(scoped["actual"].sum()),
+                "forecast": _to_float(scoped["forecast"].sum()),
+                "variance": _to_float(scoped["variance"].sum()),
+                "sparkline": [_to_float(value) for value in sparkline],
+            }
+        )
+
+    return {
+        "dimension": "bdm",
+        "left": panels[0],
+        "right": panels[1],
+    }
+
+
+def _build_insights(
+    summary: dict[str, Any],
+    trend_series: list[dict[str, Any]],
+    contribution: list[dict[str, Any]],
+    comparison: dict[str, Any],
+    performers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    insights: list[dict[str, Any]] = []
+
+    delta = comparison["delta"]
+    direction = "ahead of" if delta >= 0 else "behind"
+    insights.append(
+        {
+            "tone": "positive" if delta >= 0 else "negative",
+            "headline": f"Current run-rate is {direction} plan by {_format_currency_short(abs(delta))}.",
+            "detail": f"{comparison['label']} is moving at {comparison['deltaPct']:.1f}% variance for the selected window.",
+        }
+    )
+
+    if contribution:
+        lead = contribution[0]
+        insights.append(
+            {
+                "tone": "neutral",
+                "headline": f"{lead['label']} contributes {lead['contributionPct']:.1f}% of the visible actual revenue.",
+                "detail": f"It is currently carrying {_format_currency_short(lead['actual'])} of actuals with {_format_currency_short(lead['variance'])} variance.",
+            }
+        )
+
+    anomaly_months = [row for row in trend_series if row["anomaly"]]
+    if anomaly_months:
+        lead_anomaly = anomaly_months[0]
+        insights.append(
+            {
+                "tone": "warning",
+                "headline": f"{lead_anomaly['month']} shows an anomaly marker in the actual trend.",
+                "detail": f"Variance for that month is {_format_currency_short(lead_anomaly['variance'])} with forecast centered at {_format_currency_short(lead_anomaly['forecast'])}.",
+            }
+        )
+
+    if performers:
+        best = max(performers, key=lambda row: row["variance"])
+        weakest = min(performers, key=lambda row: row["variance"])
+        insights.append(
+            {
+                "tone": "neutral",
+                "headline": f"Top spread is {best['label']} vs {weakest['label']}.",
+                "detail": f"{best['label']} is up {_format_currency_short(best['variance'])} while {weakest['label']} is down {_format_currency_short(abs(weakest['variance']))}.",
+            }
+        )
+
+    if comparison.get("previousValue") is not None and comparison.get("previousLabel"):
+        diff = comparison["currentValue"] - comparison["previousValue"]
+        insights.append(
+            {
+                "tone": "positive" if diff >= 0 else "negative",
+                "headline": f"Current selection moved {_format_currency_short(abs(diff))} against {comparison['previousLabel']}.",
+                "detail": f"Current value is {_format_currency_short(comparison['currentValue'])} versus {_format_currency_short(comparison['previousValue'])} in the comparison window.",
+            }
+        )
+
+    return insights[:5]
+
+
+def _serialize_selected_filters(normalized: DashboardFilters) -> dict[str, Any]:
+    return {
+        "financialYear": normalized.financial_years[0] if normalized.financial_years else None,
+        "region": normalized.geographies[0] if normalized.geographies else None,
+        "practiceHead": normalized.practices[0] if normalized.practices else None,
+        "geoHead": normalized.geo_heads[0] if normalized.geo_heads else None,
+        "entity": normalized.entities[0] if normalized.entities else None,
+        "vertical": normalized.verticals[0] if normalized.verticals else None,
+        "customerName": normalized.accounts[0] if normalized.accounts else None,
+        "projectName": normalized.projects[0] if normalized.projects else None,
+        "strategicAccount": normalized.strategic_accounts[0] if normalized.strategic_accounts else None,
+        "dealType": normalized.deal_types[0] if normalized.deal_types else None,
+        "businessType": normalized.business_types[0] if normalized.business_types else None,
+        "eeennn": normalized.eeennns[0] if normalized.eeennns else None,
+        "financialYears": normalized.financial_years,
+        "geographies": normalized.geographies,
+        "practices": normalized.practices,
+        "geoHeads": normalized.geo_heads,
+        "bdms": normalized.bdms,
+        "entities": normalized.entities,
+        "verticals": normalized.verticals,
+        "accounts": normalized.accounts,
+        "projectNames": normalized.projects,
+        "strategicAccounts": normalized.strategic_accounts,
+        "dealTypes": normalized.deal_types,
+        "businessTypes": normalized.business_types,
+        "eeennns": normalized.eeennns,
+        "periodFrom": normalized.period_from,
+        "periodTo": normalized.period_to,
+        "comparisonMode": normalized.comparison_mode,
+        "comparisonMetric": normalized.comparison_metric,
+        "comparisonPeriod": normalized.comparison_period,
+        "comparePrevious": normalized.compare_previous,
+        "breakdownDimension": normalized.breakdown_dimension,
+        "whatIfPct": normalized.what_if_pct,
+    }
+
+
+def _serialize_dataset(upload_row: dict[str, Any] | None, financial_years: list[str]) -> dict[str, Any]:
+    if not upload_row:
+        return {
+            "uploadId": None,
+            "financialYear": financial_years[0] if financial_years else None,
+            "originalFilename": None,
+            "uploadedAt": None,
+            "importedRows": 0,
+            "parsedSheets": [],
+        }
+
+    uploaded_at = upload_row.get("uploaded_at")
+    if isinstance(uploaded_at, pd.Timestamp):
+        uploaded_at_value = uploaded_at.isoformat()
+    elif isinstance(uploaded_at, datetime):
+        uploaded_at_value = uploaded_at.isoformat()
+    else:
+        uploaded_at_value = None
+
+    year_value = str(upload_row.get("financial_year") or "")
+    if not year_value and financial_years:
+        year_value = financial_years[0]
+
+    return {
+        "uploadId": str(upload_row.get("id") or "") or None,
+        "financialYear": year_value or None,
+        "originalFilename": str(upload_row.get("original_filename") or "") or None,
+        "uploadedAt": uploaded_at_value,
+        "importedRows": int(upload_row.get("imported_rows") or 0),
+        "parsedSheets": list(upload_row.get("parsed_sheets") or []),
+    }
+
+
+def _resolve_period_months(period_from: str, period_to: str) -> list[str]:
+    start = period_from if period_from in MONTH_INDEX else "Apr"
+    end = period_to if period_to in MONTH_INDEX else "Mar"
+    start_index = MONTH_INDEX[start]
+    end_index = MONTH_INDEX[end]
+    if start_index > end_index:
+        start_index, end_index = end_index, start_index
+    return MONTH_LABELS[start_index : end_index + 1]
+
+
+def _normalize_comment_month(value: str | None) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    short_month = normalized[:3].title()
+    return short_month if short_month in MONTH_INDEX else normalized
+
+
+def _aggregate_comparison_frame(frame: pd.DataFrame, months: list[str], value_key: str) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=[*OVERVIEW_FORECAST_DIMENSION_COLUMNS, "month", value_key])
+
+    if not months:
+        return pd.DataFrame(columns=[*OVERVIEW_FORECAST_DIMENSION_COLUMNS, "month", value_key])
+
+    scoped = frame[frame["month"].isin(months)]
+    if scoped.empty:
+        return pd.DataFrame(columns=[*OVERVIEW_FORECAST_DIMENSION_COLUMNS, "month", value_key])
+
+    scoped = scoped.copy()
+    if "customer_name" in scoped.columns and "group_company" in scoped.columns:
+        group_company = scoped["group_company"].fillna("").map(lambda value: str(value or "").strip())
+        customer_name = scoped["customer_name"].fillna("").map(lambda value: str(value or "").strip())
+        customer_bucket = group_company.where(group_company != "", customer_name)
+        scoped["group_company"] = customer_bucket.where(customer_bucket != "", group_company)
+
+    grouped = (
+        scoped.groupby([*list(OVERVIEW_FORECAST_DIMENSION_COLUMNS), "month"], dropna=False)["amount"]
+        .sum()
+        .reset_index()
+        .rename(columns={"amount": value_key})
+    )
+    grouped[value_key] = pd.to_numeric(grouped[value_key], errors="coerce").fillna(0.0)
+    return grouped
+
+
+def _sum_frame_amount_for_months(frame: pd.DataFrame, months: list[str]) -> float:
+    if frame.empty or not months:
+        return 0.0
+    scoped = frame[frame["month"].isin(months)]
+    if scoped.empty or "amount" not in scoped.columns:
+        return 0.0
+    return float(pd.to_numeric(scoped["amount"], errors="coerce").fillna(0.0).sum())
+
+
+def _build_monthly_comparison_rows(
+    budget_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    actual_df: pd.DataFrame,
+    months: list[str],
+) -> list[dict[str, Any]]:
+    comparison_group_fields = [
+        "customer_name",
+        "group_company",
+        "ms_ps",
+        "region",
+        "practice_head",
+        "geo_head",
+        "bdm",
+        "entity",
+        "vertical",
+        "deal_type",
+        "business_type",
+        "strategic_account",
+        "eeennn",
+    ]
+    monthly_group_fields = [*comparison_group_fields, "month"]
+
+    budget = _aggregate_comparison_frame(budget_df, months, "budget")
+    forecast = _aggregate_comparison_frame(forecast_df, months, "forecast")
+    actual = _aggregate_comparison_frame(actual_df, months, "actual")
+
+    merged = budget.merge(
+        forecast,
+        on=[*list(OVERVIEW_FORECAST_DIMENSION_COLUMNS), "month"],
+        how="outer",
+    ).merge(
+        actual,
+        on=[*list(OVERVIEW_FORECAST_DIMENSION_COLUMNS), "month"],
+        how="outer",
+    )
+    if merged.empty:
+        return []
+
+    missing_forecast_mask = merged["forecast"].isna() if "forecast" in merged.columns else pd.Series(False, index=merged.index)
+    for column in ("budget", "forecast", "actual"):
+        merged[column] = pd.to_numeric(merged[column], errors="coerce").fillna(0.0)
+    merged["actual"] = merged["actual"].clip(lower=0.0)
+    merged.loc[missing_forecast_mask, "forecast"] = merged.loc[missing_forecast_mask, "budget"]
+
+    merged["variance_vs_budget"] = merged["actual"] - merged["budget"]
+    merged["variance_vs_forecast"] = merged["actual"] - merged["forecast"]
+
+    merged = (
+        merged.groupby(monthly_group_fields, dropna=False)[
+            ["budget", "forecast", "actual"]
+        ]
+        .sum()
+        .reset_index()
+    )
+    merged["budget"] = pd.to_numeric(merged["budget"], errors="coerce").fillna(0.0)
+    merged["forecast"] = pd.to_numeric(merged["forecast"], errors="coerce").fillna(0.0)
+    merged["actual"] = pd.to_numeric(merged["actual"], errors="coerce").fillna(0.0)
+    merged["actual"] = merged["actual"].clip(lower=0.0)
+    merged["variance_vs_budget"] = merged["actual"] - merged["budget"]
+    merged["variance_vs_forecast"] = merged["actual"] - merged["forecast"]
+    merged = merged[
+        (merged["budget"] != 0.0) | (merged["forecast"] != 0.0) | (merged["actual"] != 0.0)
+    ].copy()
+    if merged.empty:
+        return []
+    merged["month_sort_key"] = merged["month"].map(MONTH_INDEX).fillna(99).astype(int)
+    merged = merged.sort_values(
+        by=["month_sort_key", "actual", "forecast", "budget"],
+        ascending=[True, False, False, False],
+    )
+
+    rows: list[dict[str, Any]] = []
+    for row in merged.to_dict(orient="records"):
+        month_label = str(row.get("month") or "")
+        month_label = month_label if month_label in MONTH_INDEX else (months[-1] if months else "Mar")
+        customer_name = str(row.get("customer_name") or "")
+        group_company = (
+            str(row.get("group_company") or "").strip()
+            or str(row.get("customer_name") or "").strip()
+        )
+        customer_dimension = group_company or customer_name
+        rows.append(
+            {
+                "month": month_label,
+                "customerName": customer_name,
+                "groupCompany": group_company,
+                "customerDimension": customer_dimension,
+                "projectName": "",
+                "resourceName": "",
+                "msps": str(row.get("ms_ps") or ""),
+                "geography": str(row.get("region") or ""),
+                "practiceHead": str(row.get("practice_head") or ""),
+                "geoHead": str(row.get("geo_head") or ""),
+                "bdm": str(row.get("bdm") or ""),
+                "entity": str(row.get("entity") or ""),
+                "vertical": str(row.get("vertical") or ""),
+                "dealType": str(row.get("deal_type") or ""),
+                "businessType": str(row.get("business_type") or ""),
+                "strategicAccount": str(row.get("strategic_account") or ""),
+                "eeennn": str(row.get("eeennn") or ""),
+                "budget": float(row.get("budget") or 0.0),
+                "forecast": float(row.get("forecast") or 0.0),
+                "actual": float(row.get("actual") or 0.0),
+                "varianceVsBudget": float(row.get("variance_vs_budget") or 0.0),
+                "varianceVsForecast": float(row.get("variance_vs_forecast") or 0.0),
+            }
+        )
+
+    return rows
+
+
+def _empty_monthly_comparison_payload(
+    financial_year: str,
+    month: str,
+    database_status: dict[str, str],
+) -> dict[str, Any]:
+    resolved_month = month if month in MONTH_LABELS else "Apr"
+    return {
+        "database": database_status,
+        "financialYear": financial_year or "",
+        "comparisonMonth": resolved_month,
+        "resolvedPeriod": {
+            "financialYear": financial_year or "",
+            "periodFrom": "Apr",
+            "periodTo": resolved_month,
+            "comparisonMonth": resolved_month,
+        },
+        "dataVersion": "",
+        "scopeMode": "actuals_source_of_truth",
+        "summary": {
+            "rowCount": 0,
+            "budget": 0.0,
+            "forecast": 0.0,
+            "actual": 0.0,
+            "varianceVsBudget": 0.0,
+            "varianceVsForecast": 0.0,
+        },
+        "rows": [],
+    }
+
+
+def _empty_dashboard(
+    normalized: DashboardFilters,
+    database_status: dict[str, str],
+    filter_options: dict[str, Any] | None = None,
+    dataset: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected_filters = _serialize_selected_filters(normalized)
+    options = filter_options or {
+        "financialYears": normalized.financial_years,
+        "regions": [],
+        "practiceHeads": [],
+        "geoHeads": [],
+        "entities": [],
+        "verticals": [],
+        "customerNames": [],
+        "strategicAccounts": [],
+        "dealTypes": [],
+        "businessTypes": [],
+        "eeennns": [],
+        "bdms": [],
+        "accounts": [],
+        "periods": MONTH_LABELS,
+    }
+
+    trend_rows = [
+        {
+            "month": label,
+            "quarter": MONTH_TO_QUARTER[label],
+            "budget": 0.0,
+            "budgetMs": 0.0,
+            "budgetPs": 0.0,
+            "forecast": 0.0,
+            "forecastMs": 0.0,
+            "forecastPs": 0.0,
+            "forecastLow": 0.0,
+            "forecastHigh": 0.0,
+            "actual": 0.0,
+            "actualMs": 0.0,
+            "actualPs": 0.0,
+            "variance": 0.0,
+            "variancePct": 0.0,
+            "anomaly": False,
+        }
+        for label in MONTH_LABELS[MONTH_INDEX[normalized.period_from] : MONTH_INDEX[normalized.period_to] + 1]
+    ]
+
+    empty_summary = {
+        "rowCount": 0,
+        "resourceCount": 0,
+        "customerCount": 0,
+        "projectCount": 0,
+        "totalBudget": 0.0,
+        "totalOutlook": 0.0,
+        "totalActual": 0.0,
+        "totalVariance": 0.0,
+        "totalsByMsps": {
+            "budget": {"ms": 0.0, "ps": 0.0},
+            "forecast": {"ms": 0.0, "ps": 0.0},
+            "actual": {"ms": 0.0, "ps": 0.0},
+        },
+    }
+
+    empty_insights = [
+        {
+            "tone": "neutral",
+            "headline": "Upload a workbook to unlock intelligent analytics.",
+            "detail": database_status["message"],
+        }
+    ]
+
+    return {
+        "database": database_status,
+        "selectedFilters": selected_filters,
+        "filters": options,
+        "summary": empty_summary,
+        "monthlySeries": trend_rows,
+        "topCustomers": [],
+        "topRegions": [],
+        "resourceTable": [],
+        "dataset": dataset or {
+            "uploadId": None,
+            "financialYear": normalized.financial_years[0] if normalized.financial_years else None,
+            "originalFilename": None,
+            "uploadedAt": None,
+            "importedRows": 0,
+            "parsedSheets": [],
+        },
+        "highlights": [empty_insights[0]["headline"]],
+        "comparison": {
+            "label": "Budget vs Actual",
+            "mode": normalized.comparison_mode,
+            "period": normalized.comparison_period,
+            "currentValue": 0.0,
+            "baselineValue": 0.0,
+            "delta": 0.0,
+            "deltaPct": 0.0,
+            "previousValue": None,
+            "previousDelta": None,
+            "previousLabel": None,
+        },
+        "trend": {
+            "rows": trend_rows,
+            "metric": normalized.comparison_metric,
+            "fromPeriod": normalized.period_from,
+            "toPeriod": normalized.period_to,
+            "whatIfPct": normalized.what_if_pct,
+        },
+        "variance": {"mode": normalized.comparison_mode, "rows": []},
+        "contribution": {
+            "dimension": normalized.breakdown_dimension,
+            "dimensionLabel": PRIMARY_DIMENSION_LABELS.get(normalized.breakdown_dimension, "Geography"),
+            "rows": [],
+        },
+        "heatmap": {
+            "dimension": normalized.breakdown_dimension,
+            "xLabels": MONTH_LABELS,
+            "yLabels": [],
+            "cells": [],
+            "metric": "variance",
+        },
+        "performers": {"dimension": normalized.breakdown_dimension, "rows": []},
+        "waterfall": {"metric": normalized.comparison_metric, "steps": []},
+        "insights": empty_insights,
+        "sideBySide": None,
+        "exports": {"csvRows": 0, "pngReady": False},
+        "nlq": {
+            "supportedExamples": [
+                "Show APAC last quarter",
+                "Compare BDM Anil with BDM Ravi",
+                "Show forecast variance for North America",
+            ]
+        },
+    }
+
+
+def _empty_overview_payload(
+    normalized: DashboardFilters,
+    database_status: dict[str, str],
+) -> dict[str, Any]:
+    monthly_series = [
+        {
+            "month": month,
+            "monthIndex": MONTH_INDEX[month],
+            "quarter": MONTH_TO_QUARTER[month],
+            "budget": 0.0,
+            "budgetMs": 0.0,
+            "budgetPs": 0.0,
+            "forecast": 0.0,
+            "forecastMs": 0.0,
+            "forecastPs": 0.0,
+            "actual": 0.0,
+            "actualMs": 0.0,
+            "actualPs": 0.0,
+            "variance": 0.0,
+        }
+        for month in MONTH_LABELS
+    ]
+    return {
+        "database": database_status,
+        "summary": {
+            "rowCount": 0,
+            "resourceCount": 0,
+            "customerCount": 0,
+            "projectCount": 0,
+            "totalBudget": 0.0,
+            "totalOutlook": 0.0,
+            "totalActual": 0.0,
+            "totalVariance": 0.0,
+            "totalsByMsps": {
+                "budget": {"ms": 0.0, "ps": 0.0},
+                "forecast": {"ms": 0.0, "ps": 0.0},
+                "actual": {"ms": 0.0, "ps": 0.0},
+            },
+        },
+        "monthlySeries": monthly_series,
+        "dataset": {
+            "uploadId": None,
+            "financialYear": normalized.financial_years[0] if normalized.financial_years else None,
+            "originalFilename": None,
+            "uploadedAt": None,
+            "importedRows": 0,
+            "parsedSheets": [],
+        },
+    }
+
+def _serialize_date(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.date().isoformat()
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value) if str(value).strip() else None
+
+
+def _to_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (float, int, Decimal)):
+        return float(value)
+    try:
+        if pd.isna(value):
+            return 0.0
+    except TypeError:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_pct(value: float, baseline: float) -> float:
+    if not baseline:
+        return 0.0
+    return (value / baseline) * 100
+
+
+def _format_currency_short(value: float) -> str:
+    absolute = abs(value)
+    if absolute >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if absolute >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if absolute >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:.0f}"

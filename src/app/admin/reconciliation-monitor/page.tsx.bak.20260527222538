@@ -1,0 +1,25 @@
+import { MasterdataReconciliationMonitor } from "@/components/masterdata-reconciliation-monitor";
+import { AdminSettingsNav } from "@/components/admin-settings-nav";
+import { WorkspacePageHeader } from "@/components/workspace-page-header";
+import { getAdminUploads } from "@/lib/backend-api";
+import { getFinancialYears } from "@/lib/financial-years";
+
+export default async function AdminReconciliationMonitorPage() {
+  const uploads = await getAdminUploads();
+  const financialYears = uploads.financialYears.length > 0 ? uploads.financialYears : getFinancialYears();
+
+  return (
+    <div className="space-y-6">
+      <WorkspacePageHeader
+        eyebrow="Data Quality"
+        title="Budget vs Global Revenue monitor"
+        description="Data Center reconciliation control tower with OCN, Emp ID, name-normalization, and actual-only customer review."
+      />
+      <AdminSettingsNav />
+      <MasterdataReconciliationMonitor
+        financialYears={financialYears}
+        initialFinancialYear={financialYears.at(-1) ?? "2026-2027"}
+      />
+    </div>
+  );
+}

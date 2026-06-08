@@ -1,0 +1,344 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { LoaderCircle, RefreshCw } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+
+import { TableFullscreenShell } from "@/components/table-fullscreen-shell";
+import type { MasterdataReconciliationResult, ReconciliationRow } from "@/lib/masterdata-reconciliation";
+
+const TABLE_TABS: Array<{
+  key: keyof MasterdataReconciliationResult["tables"];
+  label: string;
+}> = [
+  { key: "referenceMaster", label: "Reference Master" },
+  { key: "customerMaster", label: "Customer Master" },
+  { key: "projectMaster", label: "Project Master" },
+  { key: "employeeMaster", label: "Employee Master" },
+  { key: "organizationMaster", label: "Organization Master" },
+  { key: "entityMaster", label: "Entity Master" },
+  { key: "aliasMapping", label: "Alias Mapping" },
+  { key: "identifierMapping", label: "MS/PS Identifier Mapping" },
+  { key: "nameNormalization", label: "Name Normalization" },
+  { key: "actualsNotInBudget", label: "Actuals Not in Budget" },
+  { key: "exceptions", label: "Unmapped / Exceptions" },
+  { key: "recordRecommendations", label: "Recommended Matching Keys" },
+];
+
+function formatNumber(value: number) {
+  return value.toLocaleString("en-US");
+}
+
+function rowText(row: ReconciliationRow, key: string) {
+  return String(row[key] ?? "").trim();
+}
+
+function uniquePreview(values: string[], limit = 3) {
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const value of values) {
+    const text = value.trim();
+    const key = text.toLowerCase();
+    if (!text || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    items.push(text);
+    if (items.length >= limit) {
+      break;
+    }
+  }
+  return items.join(", ") || "No rows in the selected year";
+}
+
+function DataGrid({
+  rows,
+  emptyMessage,
+}: {
+  rows: ReconciliationRow[];
+  emptyMessage: string;
+}) {
+  const headers = useMemo(() => {
+    const first = rows[0];
+    return first ? Object.keys(first) : [];
+  }, [rows]);
+
+  if (rows.length === 0) {
+    return (
+      <div className="rounded-2xl border border-dashed border-slate-200 bg-white px-5 py-8 text-center text-sm text-slate-600">
+        {emptyMessage}
+      </div>
+    );
+  }
+
+  return (
+    <TableFullscreenShell
+      title="Data Center reconciliation"
+      description="Full-screen view of reconciled Data Center tables."
+      className="rounded-2xl border border-slate-200 bg-white"
+    >
+      <div className="max-h-[560px] overflow-auto rounded-2xl border border-slate-200">
+        <table className="min-w-[1400px] text-left text-xs text-slate-700">
+          <thead className="sticky top-0 z-10 bg-slate-950 text-white">
+            <tr>
+              {headers.map((header) => (
+                <th
+                  key={header}
+                  className="border-b border-white/10 px-3 py-2.5 font-semibold uppercase tracking-[0.11em]"
+                >
+                  {header}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, index) => (
+              <tr
+                key={`row-${index}`}
+                className={`border-b border-slate-100 ${index % 2 === 0 ? "bg-white" : "bg-slate-50/80"}`}
+              >
+                {headers.map((header) => {
+                  const value = row[header];
+                  return (
+                    <td key={`${index}-${header}`} className="px-3 py-2.5 align-top">
+                      {typeof value === "number" ? value.toLocaleString("en-US") : String(value ?? "")}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </TableFullscreenShell>
+  );
+}
+
+type MasterdataReconciliationMonitorProps = {
+  financialYears: string[];
+  initialFinancialYear: string;
+};
+
+export function MasterdataReconciliationMonitor({
+  financialYears,
+  initialFinancialYear,
+}: MasterdataReconciliationMonitorProps) {
+  const [financialYear, setFinancialYear] = useState(initialFinancialYear);
+  const [activeTab, setActiveTab] = useState<keyof MasterdataReconciliationResult["tables"]>("identifierMapping");
+
+  const query = useQuery({
+    queryKey: ["masterdata-reconciliation-monitor", financialYear],
+    queryFn: async () => {
+      const search = new URLSearchParams({ financialYear });
+      const response = await fetch(`/api/masterdata/reconciliation?${search.toString()}`, {
+        cache: "no-store",
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | MasterdataReconciliationResult
+        | { detail?: string }
+        | null;
+      if (!response.ok || !payload || !("tables" in payload)) {
+        throw new Error(payload && "detail" in payload ? payload.detail : "Unable to load reconciliation monitor.");
+      }
+      return payload;
+    },
+    refetchOnWindowFocus: false,
+  });
+
+  const activeRows = query.data?.tables[activeTab] ?? [];
+  const qualityCards = useMemo(() => {
+    const tables = query.data?.tables;
+    if (!tables) {
+      return [];
+    }
+
+    const msRows = tables.identifierMapping.filter(
+      (row) =>
+        rowText(row, "MS/PS").toUpperCase() === "MS" &&
+        rowText(row, "OCN Number") &&
+        rowText(row, "Reference Code"),
+    );
+    const psRows = tables.identifierMapping.filter(
+      (row) =>
+        rowText(row, "MS/PS").toUpperCase() === "PS" &&
+        rowText(row, "Emp ID") &&
+        rowText(row, "Reference Code"),
+    );
+    const projectNormalizationRows = tables.nameNormalization.filter(
+      (row) => rowText(row, "Attribute Type").toLowerCase() === "project name",
+    );
+    const actualOnlyCustomers = Array.from(
+      new Set(
+        tables.actualsNotInBudget
+          .map((row) => rowText(row, "Customer Name"))
+          .filter(Boolean),
+      ),
+    );
+
+    return [
+      {
+        title: "MS mapped by OCN",
+        value: msRows.length,
+        detail: uniquePreview(msRows.map((row) => `${rowText(row, "OCN Number")} - ${rowText(row, "Actual Customer")}`)),
+        tab: "identifierMapping" as const,
+      },
+      {
+        title: "PS mapped by Emp ID",
+        value: psRows.length,
+        detail: uniquePreview(psRows.map((row) => `${rowText(row, "Emp ID")} - ${rowText(row, "Actual Resource")}`)),
+        tab: "identifierMapping" as const,
+      },
+      {
+        title: "Project name normalized",
+        value: projectNormalizationRows.length,
+        detail: uniquePreview(
+          projectNormalizationRows.map(
+            (row) => `${rowText(row, "Actual Value")} -> ${rowText(row, "Budget Standard Value")}`,
+          ),
+        ),
+        tab: "nameNormalization" as const,
+      },
+      {
+        title: "Actual-only customers",
+        value: actualOnlyCustomers.length,
+        detail: uniquePreview(actualOnlyCustomers),
+        tab: "actualsNotInBudget" as const,
+      },
+    ];
+  }, [query.data]);
+
+  return (
+    <section className="space-y-5">
+      <div className="surface-card px-6 py-6">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.17em] text-slate-500">Admin Data Quality</p>
+            <h3 className="mt-2 text-2xl font-semibold text-slate-950">
+              Budget vs Global Revenue reconciliation monitor
+            </h3>
+            <p className="mt-2 text-sm text-slate-600">
+              MS rows map by OCN Number, PS rows map by Emp ID, name normalization explains aliases, and actual-only customers are isolated for review.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="grid gap-1 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+              Financial Year
+              <select
+                value={financialYear}
+                onChange={(event) => setFinancialYear(event.target.value)}
+                className="auth-input min-w-[160px]"
+              >
+                {financialYears.map((year) => (
+                  <option key={year} value={year}>
+                    {year}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void query.refetch()}
+              className="inline-flex h-11 items-center gap-2 rounded-full border border-slate-200 bg-white px-4 text-xs font-semibold uppercase tracking-[0.12em] text-slate-700"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {query.isLoading ? (
+        <div className="rounded-2xl border border-slate-200 bg-white px-5 py-10 text-sm text-slate-600">
+          <span className="inline-flex items-center gap-2">
+            <LoaderCircle className="h-4 w-4 animate-spin" />
+            Building reconciliation masters and alias maps...
+          </span>
+        </div>
+      ) : query.isError || !query.data ? (
+        <div className="rounded-2xl border border-rose-200 bg-rose-50 px-5 py-8 text-sm text-rose-700">
+          Unable to build reconciliation output. Check active budget/global uploads for this year.
+        </div>
+      ) : (
+        <>
+          <section className="grid gap-3 lg:grid-cols-4">
+            {query.data.mappingExplanation.map((item, index) => (
+              <article
+                key={item}
+                className="rounded-2xl border border-cyan-100 bg-[linear-gradient(145deg,rgba(236,254,255,0.92),rgba(255,255,255,0.82))] px-4 py-3 text-sm text-slate-700 shadow-[0_14px_34px_rgba(8,145,178,0.08)]"
+              >
+                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-800">
+                  Rule {index + 1}
+                </p>
+                <p className="mt-2 leading-6">{item}</p>
+              </article>
+            ))}
+          </section>
+
+          <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            {qualityCards.map((card) => (
+              <button
+                key={card.title}
+                type="button"
+                onClick={() => setActiveTab(card.tab)}
+                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-left transition hover:border-slate-300 hover:shadow-sm"
+              >
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">{card.title}</p>
+                <p className="mt-1 text-xl font-semibold text-slate-950">{formatNumber(card.value)}</p>
+                <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-600">{card.detail}</p>
+              </button>
+            ))}
+          </section>
+
+          <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+            <article className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">Budget Rows</p>
+              <p className="mt-1 text-lg font-semibold text-slate-950">{formatNumber(query.data.summary.budgetRows)}</p>
+            </article>
+            <article className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">Actual Rows</p>
+              <p className="mt-1 text-lg font-semibold text-slate-950">{formatNumber(query.data.summary.actualRows)}</p>
+            </article>
+            <article className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-emerald-800">Auto Approved</p>
+              <p className="mt-1 text-lg font-semibold text-emerald-900">{formatNumber(query.data.summary.autoApproved)}</p>
+            </article>
+            <article className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-sky-800">Review Recommended</p>
+              <p className="mt-1 text-lg font-semibold text-sky-900">{formatNumber(query.data.summary.reviewRecommended)}</p>
+            </article>
+            <article className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-amber-800">Review Required</p>
+              <p className="mt-1 text-lg font-semibold text-amber-900">{formatNumber(query.data.summary.reviewRequired)}</p>
+            </article>
+            <article className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-rose-800">Unmapped</p>
+              <p className="mt-1 text-lg font-semibold text-rose-900">{formatNumber(query.data.summary.unmapped)}</p>
+            </article>
+          </section>
+
+          <section className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-3">
+            <div className="flex min-w-max gap-2">
+              {TABLE_TABS.map((tab) => {
+                const active = tab.key === activeTab;
+                return (
+                  <button
+                    key={tab.key}
+                    type="button"
+                    onClick={() => setActiveTab(tab.key)}
+                    className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                      active ? "bg-slate-950 text-white" : "border border-slate-200 bg-white text-slate-700"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          <DataGrid rows={activeRows} emptyMessage="No rows are available for this table in the selected year." />
+        </>
+      )}
+    </section>
+  );
+}

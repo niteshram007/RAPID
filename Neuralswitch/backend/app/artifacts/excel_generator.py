@@ -1,0 +1,138 @@
+﻿from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
+from app.artifacts.table_utils import coerce_number
+from app.schemas.chat import ChartData, TableData
+
+HEADER_FILL = PatternFill("solid", fgColor="003323")
+HEADER_FONT = Font(color="FFFDEE", bold=True)
+TOTAL_FILL = PatternFill("solid", fgColor="EAF3EF")
+THIN_BORDER = Border(bottom=Side(style="thin", color="D7E3DD"))
+
+
+def _write_table(ws, table: TableData) -> None:
+    columns = [str(column) for column in table.columns]
+    ws.append(columns)
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = THIN_BORDER
+    numeric_columns: set[int] = set()
+    for row in table.rows:
+        values: list[Any] = []
+        for index, value in enumerate(row, start=1):
+            numeric = coerce_number(value)
+            if numeric is not None and not isinstance(value, str):
+                values.append(numeric)
+                numeric_columns.add(index)
+            elif numeric is not None and str(value).strip().replace(".", "", 1).replace("-", "", 1).isdigit():
+                values.append(numeric)
+                numeric_columns.add(index)
+            else:
+                values.append(value)
+        ws.append(values)
+    max_row = ws.max_row
+    max_col = ws.max_column
+    if max_row >= 2:
+        total_row = max_row + 1
+        ws.cell(total_row, 1).value = "Total"
+        ws.cell(total_row, 1).font = Font(bold=True)
+        ws.cell(total_row, 1).fill = TOTAL_FILL
+        for col in range(2, max_col + 1):
+            if any(coerce_number(ws.cell(row, col).value) is not None for row in range(2, max_row + 1)):
+                ws.cell(total_row, col).value = f"=SUM({get_column_letter(col)}2:{get_column_letter(col)}{max_row})"
+                ws.cell(total_row, col).number_format = '$#,##0.00;[Red]-$#,##0.00'
+                ws.cell(total_row, col).font = Font(bold=True)
+                ws.cell(total_row, col).fill = TOTAL_FILL
+        max_row = total_row
+    for row in ws.iter_rows(min_row=2, max_row=max_row):
+        for cell in row:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+            cell.border = THIN_BORDER
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    if ws.max_row >= 2 and ws.max_column >= 1:
+        ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+        tab = Table(displayName="RapidData", ref=ref)
+        tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium4", showRowStripes=True, showColumnStripes=False)
+        try:
+            ws.add_table(tab)
+        except ValueError:
+            pass
+    for col in range(1, ws.max_column + 1):
+        letter = get_column_letter(col)
+        width = max(12, min(34, max(len(str(ws.cell(row, col).value or "")) for row in range(1, ws.max_row + 1)) + 2))
+        ws.column_dimensions[letter].width = width
+
+
+def _add_excel_chart(ws, chart: ChartData | None, table: TableData) -> None:
+    if chart is None or not table.rows or len(table.columns) < 2:
+        return
+    columns = [str(column) for column in table.columns]
+    x_index = columns.index(chart.x) + 1 if chart.x in columns else 1
+    y_index = columns.index(chart.y) + 1 if chart.y in columns else 2
+    max_data_row = min(len(table.rows) + 1, 16)
+    if max_data_row < 2:
+        return
+    if str(chart.type).lower() == "pie":
+        excel_chart = PieChart()
+    elif str(chart.type).lower() == "line":
+        excel_chart = LineChart()
+    else:
+        excel_chart = BarChart()
+    data = Reference(ws, min_col=y_index, min_row=1, max_row=max_data_row)
+    cats = Reference(ws, min_col=x_index, min_row=2, max_row=max_data_row)
+    excel_chart.add_data(data, titles_from_data=True)
+    excel_chart.set_categories(cats)
+    excel_chart.title = f"{chart.y} by {chart.x}"
+    excel_chart.height = 8
+    excel_chart.width = 15
+    ws.add_chart(excel_chart, f"{get_column_letter(min(ws.max_column + 2, 10))}2")
+
+
+def generate_excel(path: Path, *, title: str, table: TableData, chart: ChartData | None, answer: str | None = None) -> None:
+    wb = Workbook()
+    summary = wb.active
+    summary.title = "Summary"
+    summary["A1"] = title
+    summary["A1"].font = Font(size=18, bold=True, color="003323")
+    summary["A3"] = "Rows"
+    summary["B3"] = len(table.rows)
+    summary["A4"] = "Columns"
+    summary["B4"] = len(table.columns)
+    summary["A6"] = "Executive Summary"
+    summary["A6"].font = Font(bold=True, color="003323")
+    summary["A7"] = answer or "Generated by NeuralSwitch from validated RAPID/chat result data."
+    summary["A7"].alignment = Alignment(wrap_text=True, vertical="top")
+    summary.column_dimensions["A"].width = 24
+    summary.column_dimensions["B"].width = 18
+
+    data_ws = wb.create_sheet("Data")
+    _write_table(data_ws, table)
+    _add_excel_chart(data_ws, chart, table)
+
+    insights = wb.create_sheet("Insights")
+    insights.append(["Insight", "Detail"])
+    for cell in insights[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+    insights.append(["Source", "Generated from NeuralSwitch verified table metadata."])
+    insights.append(["Chart", f"{chart.type} chart using {chart.y} by {chart.x}" if chart else "No chart requested."])
+    insights.append(["Next step", "Use filters or ask NeuralSwitch for a drilldown by customer, BDM, Geo, Practice, MS/PS, or month."])
+    insights.column_dimensions["A"].width = 22
+    insights.column_dimensions["B"].width = 90
+    for row in insights.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    wb.save(path)

@@ -1,0 +1,755 @@
+import { getRevenueAccessScope, getSessionProfile, type SessionProfile } from "@/lib/auth";
+import { buildBackendAuthHeaders } from "@/lib/backend-security";
+import type {
+  ForecastDraftSaveResponse,
+  ForecastSubmissionMatrix,
+  ForecastSubmitResponse,
+  ForecastRowCreateRequest,
+  ForecastSubmissionRow,
+  ForecastSheetResponse,
+  ProjectAssignmentRequestRow,
+  ProjectAssignmentWorkbench,
+  ProjectReassignmentPayload,
+  ProjectReassignmentResponse,
+  RevenueMetaReason,
+  RevenueBudgetKioskResponse,
+  RevenueComparisonResponse,
+  RapidRevenueOverview,
+  RapidRevenueRow,
+  RapidRevenueScopeFilters,
+  RevenueNotification,
+} from "@/lib/rapid-revenue";
+import { buildRapidRevenueSearch } from "@/lib/rapid-revenue";
+
+const BACKEND_API_URL = process.env.BACKEND_API_URL ?? "http://127.0.0.1:8000";
+const BACKEND_FETCH_TIMEOUT_MS = Math.max(
+  Number(process.env.BACKEND_FETCH_TIMEOUT_MS ?? 30000),
+  1000,
+);
+const BACKEND_RESPONSE_CACHE_TTL_MS = Math.max(
+  Number(process.env.RAPID_SERVER_RESPONSE_CACHE_TTL_MS ?? 20000),
+  0,
+);
+const BACKEND_RESPONSE_CACHE_MAX_ENTRIES = Math.max(
+  Number(process.env.RAPID_SERVER_RESPONSE_CACHE_MAX_ENTRIES ?? 256),
+  64,
+);
+const backendResponseCache = new Map<
+  string,
+  { expiresAt: number; savedAt: number; value: unknown }
+>();
+
+type RevenueBackendFailureReason = Exclude<RevenueMetaReason, "no_data_period">;
+export type RevenueBackendFetchMeta = {
+  dataState: "fresh" | "stale" | "fallback";
+  reason?: RevenueBackendFailureReason;
+  statusCode?: number;
+  lastSuccessAt?: string | null;
+};
+
+export type RevenueBackendFetchResult<T> = {
+  payload: T;
+  meta: RevenueBackendFetchMeta;
+};
+
+function pruneBackendResponseCache(now: number) {
+  for (const [key, entry] of backendResponseCache.entries()) {
+    if (entry.expiresAt <= now) {
+      backendResponseCache.delete(key);
+    }
+  }
+  while (backendResponseCache.size > BACKEND_RESPONSE_CACHE_MAX_ENTRIES) {
+    const oldestKey = backendResponseCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    backendResponseCache.delete(oldestKey);
+  }
+}
+
+function mapBackendFailureReason(statusCode: number): RevenueBackendFailureReason {
+  if (statusCode === 401) {
+    return "unauthorized";
+  }
+  if (statusCode === 403) {
+    return "forbidden";
+  }
+  if (statusCode === 408 || statusCode === 504) {
+    return "timeout";
+  }
+  return "backend_unavailable";
+}
+
+async function fetchRevenueBackendWithMeta<T>(
+  path: string,
+  fallback: T,
+  options?: {
+    cacheable?: boolean;
+    cacheKey?: string;
+  },
+): Promise<RevenueBackendFetchResult<T>> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), BACKEND_FETCH_TIMEOUT_MS);
+  const session = await getSessionProfile().catch(() => null);
+  const cacheable = Boolean(options?.cacheable) && BACKEND_RESPONSE_CACHE_TTL_MS > 0;
+  const scopeKey = session
+    ? `${session.userId}:${session.role?.id ?? session.roleId ?? "unknown-role"}`
+    : "anonymous";
+  const responseCacheKey =
+    options?.cacheKey && options.cacheKey.trim().length > 0
+      ? `${scopeKey}:${options.cacheKey.trim()}`
+      : `${scopeKey}:${path}`;
+  const now = Date.now();
+  const cached = cacheable ? backendResponseCache.get(responseCacheKey) : undefined;
+  const cachedTimestamp = cached ? new Date(cached.savedAt).toISOString() : null;
+
+  if (cacheable) {
+    if (cached && cached.expiresAt > now) {
+      return {
+        payload: cached.value as T,
+        meta: {
+          dataState: "fresh",
+          lastSuccessAt: cachedTimestamp,
+        },
+      };
+    }
+    if (cached && cached.expiresAt <= now) {
+      backendResponseCache.delete(responseCacheKey);
+    }
+  }
+
+  try {
+    const response = await fetch(`${BACKEND_API_URL}${path}`, {
+      cache: "no-store",
+      headers: session ? buildBackendAuthHeaders(session) : undefined,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const reason = mapBackendFailureReason(response.status);
+      if (cached) {
+        return {
+          payload: cached.value as T,
+          meta: {
+            dataState: "stale",
+            reason,
+            statusCode: response.status,
+            lastSuccessAt: cachedTimestamp,
+          },
+        };
+      }
+      return {
+        payload: fallback,
+        meta: {
+          dataState: "fallback",
+          reason,
+          statusCode: response.status,
+          lastSuccessAt: null,
+        },
+      };
+    }
+    const body = (await response.json()) as T;
+    if (cacheable) {
+      const responseSavedAt = Date.now();
+      backendResponseCache.set(responseCacheKey, {
+        expiresAt: responseSavedAt + BACKEND_RESPONSE_CACHE_TTL_MS,
+        savedAt: responseSavedAt,
+        value: body,
+      });
+      pruneBackendResponseCache(responseSavedAt);
+    }
+    return {
+      payload: body,
+      meta: {
+        dataState: "fresh",
+        lastSuccessAt: new Date(Date.now()).toISOString(),
+      },
+    };
+  } catch (error) {
+    const reason: RevenueBackendFailureReason =
+      controller.signal.aborted ||
+      (error instanceof DOMException && error.name === "AbortError")
+        ? "timeout"
+        : "backend_unavailable";
+    if (cached) {
+      return {
+        payload: cached.value as T,
+        meta: {
+          dataState: "stale",
+          reason,
+          lastSuccessAt: cachedTimestamp,
+        },
+      };
+    }
+    return {
+      payload: fallback,
+      meta: {
+        dataState: "fallback",
+        reason,
+        lastSuccessAt: null,
+      },
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchRevenueBackend<T>(
+  path: string,
+  fallback: T,
+  options?: {
+    cacheable?: boolean;
+    cacheKey?: string;
+  },
+): Promise<T> {
+  const result = await fetchRevenueBackendWithMeta(path, fallback, options);
+  return result.payload;
+}
+
+export function buildRapidRevenueScopeFilters(
+  session: SessionProfile,
+): RapidRevenueScopeFilters {
+  const scope = getRevenueAccessScope(session);
+  return {
+    practiceHeads: scope.practiceHeads,
+    geoHeads: scope.geoHeads,
+    bdms: scope.bdms,
+    entities: scope.entities,
+    verticals: scope.verticals,
+  };
+}
+
+function mergeScopedValues(requested: string[] | undefined, allowed: string[] | undefined) {
+  if (!allowed || allowed.length === 0) {
+    return requested;
+  }
+  if (!requested || requested.length === 0) {
+    return allowed;
+  }
+  const normalizedAllowed = new Map<string, string>();
+  for (const value of allowed) {
+    const key = value.trim().toLowerCase();
+    if (!key || normalizedAllowed.has(key)) {
+      continue;
+    }
+    normalizedAllowed.set(key, value);
+  }
+
+  const merged: string[] = [];
+  for (const value of requested) {
+    const key = value.trim().toLowerCase();
+    const canonical = normalizedAllowed.get(key);
+    if (canonical) {
+      merged.push(canonical);
+    }
+  }
+
+  return Array.from(new Set(merged));
+}
+
+export function mergeScopedRevenueFilters(
+  session: SessionProfile,
+  requested: RapidRevenueScopeFilters = {},
+): RapidRevenueScopeFilters {
+  const scope = buildRapidRevenueScopeFilters(session);
+  return {
+    financialYear: requested.financialYear,
+    periodFrom: requested.periodFrom,
+    periodTo: requested.periodTo,
+    practiceHeads: mergeScopedValues(requested.practiceHeads, scope.practiceHeads),
+    bdms: mergeScopedValues(requested.bdms, scope.bdms),
+    geoHeads: mergeScopedValues(requested.geoHeads, scope.geoHeads),
+    verticals: mergeScopedValues(requested.verticals, scope.verticals),
+    horizontals: requested.horizontals,
+    msps: requested.msps,
+    customerNames: requested.customerNames,
+    rowUs: requested.rowUs,
+    entities: mergeScopedValues(requested.entities, scope.entities),
+    strategicAccounts: requested.strategicAccounts,
+    dealTypes: requested.dealTypes,
+    eeennns: requested.eeennns,
+    projectNames: requested.projectNames,
+  };
+}
+
+export async function getRapidRevenueRows(filters: RapidRevenueScopeFilters = {}) {
+  const search = buildRapidRevenueSearch(filters);
+  return fetchRevenueBackend<RapidRevenueRow[]>(
+    `/api/revenue${search ? `?${search}` : ""}`,
+    [],
+  );
+}
+
+export async function getRapidRevenueSlicerOptions(filters: RapidRevenueScopeFilters = {}) {
+  const search = buildRapidRevenueSearch(filters);
+  return fetchRevenueBackend<Record<string, string[]>>(
+    `/api/revenue/slicer-options${search ? `?${search}` : ""}`,
+    {},
+  );
+}
+
+export async function getRapidRevenueOverview(filters: RapidRevenueScopeFilters = {}) {
+  const search = buildRapidRevenueSearch(filters);
+  return fetchRevenueBackend<RapidRevenueOverview>(
+    `/api/revenue/overview${search ? `?${search}` : ""}`,
+    {
+      rowCount: 0,
+      customerCount: 0,
+      resourceCount: 0,
+      totalFY: 0,
+      financialYear: null,
+      currentMonthLabel: null,
+      monthToDateTotal: 0,
+      yearToDateTotal: 0,
+      topPractice: null,
+      topGeoHead: null,
+      topBDM: null,
+      latestUploadAt: null,
+      latestUploadName: null,
+    },
+    {
+      cacheable: true,
+      cacheKey: `overview:${search}`,
+    },
+  );
+}
+
+function buildWorkspaceComparisonSearch(filters: RapidRevenueScopeFilters = {}) {
+  const search = new URLSearchParams();
+  if (filters.financialYear) {
+    search.set("financialYear", filters.financialYear);
+  }
+  if (filters.periodFrom) {
+    search.set("periodFrom", filters.periodFrom);
+  }
+  if (filters.periodTo) {
+    search.set("periodTo", filters.periodTo);
+  }
+  (filters.practiceHeads ?? []).forEach((value) => search.append("practices", value));
+  (filters.bdms ?? []).forEach((value) => search.append("bdms", value));
+  (filters.geoHeads ?? []).forEach((value) => search.append("geoHeads", value));
+  (filters.verticals ?? []).forEach((value) => search.append("verticals", value));
+  (filters.entities ?? []).forEach((value) => search.append("entities", value));
+  (filters.rowUs ?? []).forEach((value) => search.append("geographies", value));
+  (filters.customerNames ?? []).forEach((value) => search.append("accounts", value));
+  (filters.dealTypes ?? []).forEach((value) => search.append("dealTypes", value));
+  (filters.msps ?? []).forEach((value) => search.append("businessTypes", value));
+  return search.toString();
+}
+
+export async function getRapidRevenueBudgetKiosk(filters: RapidRevenueScopeFilters = {}) {
+  const result = await getRapidRevenueBudgetKioskDetailed(filters);
+  return result.payload;
+}
+
+export async function getRapidRevenueBudgetKioskDetailed(
+  filters: RapidRevenueScopeFilters = {},
+) {
+  const search = buildWorkspaceComparisonSearch(filters);
+  return fetchRevenueBackendWithMeta<RevenueBudgetKioskResponse>(
+    `/api/workspace/revenue-budget-kiosk${search ? `?${search}` : ""}`,
+    {
+      database: {
+        status: "offline",
+        message: "FastAPI backend is unavailable.",
+      },
+      financialYear: filters.financialYear ?? "",
+      periodFrom: "Apr",
+      periodTo: "Mar",
+      tables: {},
+    },
+    {
+      cacheable: true,
+      cacheKey: `budget-kiosk:${search}`,
+    },
+  );
+}
+
+export async function getRapidRevenueComparison(filters: RapidRevenueScopeFilters = {}) {
+  const result = await getRapidRevenueComparisonDetailed(filters);
+  return result.payload;
+}
+
+export async function getRapidRevenueComparisonDetailed(
+  filters: RapidRevenueScopeFilters = {},
+) {
+  const search = buildWorkspaceComparisonSearch(filters);
+  return fetchRevenueBackendWithMeta<RevenueComparisonResponse>(
+    `/api/workspace/revenue-comparison${search ? `?${search}` : ""}`,
+    {
+      database: {
+        status: "offline",
+        message: "FastAPI backend is unavailable.",
+      },
+      financialYear: filters.financialYear ?? "",
+      comparisonMonth: "Apr",
+      summary: {
+        rowCount: 0,
+        budget: 0,
+        forecast: 0,
+        actual: 0,
+        varianceVsBudget: 0,
+        varianceVsForecast: 0,
+      },
+      rows: [],
+    },
+    {
+      cacheable: true,
+      cacheKey: `comparison:${search}`,
+    },
+  );
+}
+
+export async function getForecastSheet(
+  session: SessionProfile,
+  forecastMonth?: string | null,
+  msps?: string[],
+  selectedBdms?: string[],
+  selectedPracticeHeads?: string[],
+  financialYear?: string | null,
+  previewDrafts = false,
+  includeAllMonths = false,
+) {
+  const scope = getRevenueAccessScope(session);
+  const search = new URLSearchParams({
+    userId: session.userId,
+    userName: session.name,
+  });
+  scope.bdms.forEach((bdm) => search.append("bdms", bdm));
+  scope.practiceHeads.forEach((value) => search.append("practiceHeads", value));
+  scope.geoHeads.forEach((value) => search.append("geoHeads", value));
+  scope.entities.forEach((value) => search.append("entities", value));
+  scope.verticals.forEach((value) => search.append("verticals", value));
+  if (forecastMonth) {
+    search.set("forecastMonth", forecastMonth);
+  }
+  if (financialYear) {
+    search.set("financialYear", financialYear);
+  }
+  if (previewDrafts) {
+    search.set("previewDrafts", "1");
+    search.set("submitterRoleId", session.role?.id ?? "bdm");
+  }
+  if (includeAllMonths) {
+    search.set("includeAllMonths", "1");
+  }
+  (msps ?? []).forEach((value) => search.append("msps", value));
+  mergeScopedValues(selectedBdms, scope.bdms)?.forEach((value) =>
+    search.append("selectedBdms", value),
+  );
+  mergeScopedValues(selectedPracticeHeads, scope.practiceHeads)?.forEach((value) =>
+    search.append("selectedPracticeHeads", value),
+  );
+  return fetchRevenueBackend<ForecastSheetResponse>(
+    `/api/revenue/forecast-sheet?${search.toString()}`,
+    {
+      forecastMonth: forecastMonth ?? "Apr 2026",
+      financialYear: null,
+      hasActiveUpload: false,
+      bdmOptions: [],
+      forecastControls: {
+        lockinDay: 1,
+        lockoutDay: 10,
+        rolloutStartMonth: "Apr 2026",
+        activeMonth: "Apr 2026",
+        visibleMonths: [
+          "Apr 2026",
+          "May 2026",
+          "Jun 2026",
+          "Jul 2026",
+          "Aug 2026",
+          "Sep 2026",
+          "Oct 2026",
+          "Nov 2026",
+          "Dec 2026",
+          "Jan 2027",
+          "Feb 2027",
+          "Mar 2027",
+        ],
+        lockedMonths: [],
+        editableMonths: [
+          "Apr 2026",
+          "May 2026",
+          "Jun 2026",
+          "Jul 2026",
+          "Aug 2026",
+          "Sep 2026",
+          "Oct 2026",
+          "Nov 2026",
+          "Dec 2026",
+          "Jan 2027",
+          "Feb 2027",
+          "Mar 2027",
+        ],
+        submissionWindowOpen: true,
+        updatedBy: null,
+        updatedAt: null,
+      },
+      rows: [],
+      monthSnapshots: includeAllMonths ? {} : undefined,
+      summary: {
+        rowCount: 0,
+        submittedRows: 0,
+        isPastDue: false,
+        dueDay: 10,
+        userId: session.userId,
+        userName: session.name,
+      },
+    },
+  );
+}
+
+export async function saveForecastDraftSheet(
+  session: SessionProfile,
+  forecastMonth: string,
+  rows: ForecastSubmissionRow[],
+) {
+  const scope = getRevenueAccessScope(session);
+  const response = await fetch(`${BACKEND_API_URL}/api/revenue/forecast-draft`, {
+    method: "POST",
+    headers: buildBackendAuthHeaders(session, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({
+      userId: session.userId,
+      userName: session.name,
+      bdms: scope.bdms,
+      submitterRoleId: session.role?.id ?? "bdm",
+      forecastMonth,
+      rows,
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as
+      | { detail?: string }
+      | null;
+    throw new Error(payload?.detail ?? "Unable to autosave forecast draft.");
+  }
+
+  return (await response.json()) as ForecastDraftSaveResponse;
+}
+
+export async function submitForecastSheet(
+  session: SessionProfile,
+  forecastMonth: string,
+  rows: ForecastSubmissionRow[],
+) {
+  const scope = getRevenueAccessScope(session);
+  const response = await fetch(`${BACKEND_API_URL}/api/revenue/forecast-submit`, {
+    method: "POST",
+    headers: buildBackendAuthHeaders(session, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({
+      userId: session.userId,
+      userName: session.name,
+      bdms: scope.bdms,
+      submitterRoleId: session.role?.id ?? "bdm",
+      forecastMonth,
+      rows,
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as
+      | { detail?: string }
+      | null;
+    throw new Error(payload?.detail ?? "Unable to save forecast.");
+  }
+
+  return (await response.json()) as ForecastSubmitResponse;
+}
+
+export async function createForecastRow(
+  session: SessionProfile,
+  payload: ForecastRowCreateRequest,
+) {
+  const scope = getRevenueAccessScope(session);
+  const response = await fetch(`${BACKEND_API_URL}/api/revenue/forecast-row`, {
+    method: "POST",
+    headers: buildBackendAuthHeaders(session, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({
+      mode: payload.mode,
+      recordId: payload.recordId,
+      financialYear: payload.financialYear ?? null,
+      values: payload.values ?? {},
+      userId: session.userId,
+      userName: session.name,
+      bdms: scope.bdms,
+      practiceHeads: scope.practiceHeads,
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? "Unable to create forecast row.");
+  }
+
+  return (await response.json()) as {
+    status: string;
+    recordId: number;
+    sourceRecordId?: number;
+  };
+}
+
+export async function deleteForecastRow(
+  session: SessionProfile,
+  recordId: number,
+) {
+  const scope = getRevenueAccessScope(session);
+  const search = new URLSearchParams({
+    userId: session.userId,
+    userName: session.name,
+  });
+  scope.bdms.forEach((bdm) => search.append("bdms", bdm));
+  const response = await fetch(
+    `${BACKEND_API_URL}/api/revenue/forecast-row/${recordId}?${search.toString()}`,
+    {
+      method: "DELETE",
+      headers: buildBackendAuthHeaders(session),
+      cache: "no-store",
+      signal: AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS),
+    },
+  );
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? "Unable to delete forecast row.");
+  }
+
+  return (await response.json()) as {
+    status: string;
+    recordId: number;
+  };
+}
+
+export async function getProjectAssignmentWorkbench(
+  session: SessionProfile,
+) {
+  const scope = getRevenueAccessScope(session);
+  const search = new URLSearchParams();
+  scope.geoHeads.forEach((geoHead) => search.append("geoHeads", geoHead));
+  return fetchRevenueBackend<ProjectAssignmentWorkbench>(
+    `/api/revenue/project-assignment-requests?${search.toString()}`,
+    {
+      projects: [],
+      bdmOptions: [],
+      geoHeadOptions: [],
+      practiceHeadOptions: [],
+      monthOptions: [],
+      requests: [],
+    },
+  );
+}
+
+export async function applyProjectReassignment(
+  session: SessionProfile,
+  payload: ProjectReassignmentPayload,
+) {
+  const response = await fetch(`${BACKEND_API_URL}/api/revenue/project-assignment`, {
+    method: "POST",
+    headers: buildBackendAuthHeaders(session, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({
+      userId: session.userId,
+      userName: session.name,
+      ...payload,
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? "Unable to apply project reassignment.");
+  }
+  return (await response.json()) as ProjectReassignmentResponse;
+}
+
+export async function createProjectAssignmentRequest(
+  session: SessionProfile,
+  recordId: number,
+  bdm: string,
+) {
+  const response = await fetch(`${BACKEND_API_URL}/api/revenue/project-assignment-requests`, {
+    method: "POST",
+    headers: buildBackendAuthHeaders(session, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({
+      userId: session.userId,
+      userName: session.name,
+      recordId,
+      bdm,
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? "Unable to create project assignment request.");
+  }
+  return (await response.json()) as { status: string; request: ProjectAssignmentRequestRow };
+}
+
+export async function decideProjectAssignmentRequest(
+  session: SessionProfile,
+  requestId: string,
+  decision: "approved" | "rejected",
+  note?: string,
+) {
+  const scope = getRevenueAccessScope(session);
+  const response = await fetch(`${BACKEND_API_URL}/api/revenue/project-assignment-requests`, {
+    method: "PATCH",
+    headers: buildBackendAuthHeaders(session, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({
+      userId: session.userId,
+      userName: session.name,
+      geoHeads: scope.geoHeads,
+      requestId,
+      decision,
+      note,
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? "Unable to process project assignment request.");
+  }
+  return (await response.json()) as { status: string; request: ProjectAssignmentRequestRow };
+}
+
+export async function getRapidRevenueNotifications(session: SessionProfile) {
+  const scope = getRevenueAccessScope(session);
+  const search = new URLSearchParams({
+    roleId: session.role?.id ?? "executive",
+    userId: session.userId,
+  });
+  scope.bdms.forEach((bdm) => search.append("bdms", bdm));
+  scope.practiceHeads.forEach((practiceHead) => search.append("practiceHeads", practiceHead));
+  scope.geoHeads.forEach((geoHead) => search.append("geoHeads", geoHead));
+  return fetchRevenueBackend<{
+    notifications: RevenueNotification[];
+    forecastSubmissionMatrix: ForecastSubmissionMatrix;
+  }>(
+    `/api/revenue/notifications?${search.toString()}`,
+    {
+      notifications: [],
+      forecastSubmissionMatrix: {
+        columns: { bdm: [], practiceHead: [] },
+        rows: [],
+      },
+    },
+  );
+}

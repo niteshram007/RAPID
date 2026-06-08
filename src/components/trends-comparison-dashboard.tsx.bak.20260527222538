@@ -1,0 +1,746 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { BarChart3, LoaderCircle, Table2 } from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  Line,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+
+import { useDrillDown } from "@/hooks/useDrillDown";
+
+type TrendSummaryRow = {
+  month: string;
+  quarter: string;
+  budget: number;
+  actual: number;
+  variance: number;
+  vertical: string;
+  horizontal: string;
+  region: string;
+  msps: string;
+};
+
+type DimensionKey = "vertical" | "horizontal" | "region" | "msps";
+type PeriodView = "monthly" | "quarter" | "ytd" | "mtd";
+
+type DimensionRow = {
+  label: string;
+  budget: number;
+  actual: number;
+  variance: number;
+};
+
+const MONTH_ORDER = [
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+  "Jan",
+  "Feb",
+  "Mar",
+] as const;
+const MONTH_INDEX: Record<string, number> = Object.fromEntries(
+  MONTH_ORDER.map((month, index) => [month, index]),
+) as Record<string, number>;
+const CORPORATE_COLORS = {
+  budget: "#0B3C5D",
+  actual: "#13B0A5",
+  variance: "#1E88E5",
+};
+const DEFAULT_FINANCIAL_YEAR = "2025-2026";
+const DIMENSIONS: Array<{ key: DimensionKey; title: string }> = [
+  { key: "vertical", title: "Vertical" },
+  { key: "horizontal", title: "Horizontal" },
+  { key: "region", title: "Region (Actuals: Region 2)" },
+  { key: "msps", title: "MS/PS Budget" },
+];
+
+function toNumber(value: unknown) {
+  const numeric = Number(value ?? 0);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function toText(value: unknown) {
+  return String(value ?? "").trim();
+}
+
+function monthKey(value: string) {
+  const shortMonth = toText(value).slice(0, 3);
+  return MONTH_INDEX[shortMonth] === undefined ? "" : shortMonth;
+}
+
+function monthIndex(value: string) {
+  const key = monthKey(value);
+  return key ? MONTH_INDEX[key] : -1;
+}
+
+function quarterFromMonth(month: string) {
+  const index = monthIndex(month);
+  if (index < 0) {
+    return "Q1";
+  }
+  if (index <= 2) {
+    return "Q1";
+  }
+  if (index <= 5) {
+    return "Q2";
+  }
+  if (index <= 8) {
+    return "Q3";
+  }
+  return "Q4";
+}
+
+function formatCurrency(value: number) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(value);
+}
+
+function formatCompactCurrency(value: number) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
+function resolveInitialPeriod(searchParams: URLSearchParams): PeriodView {
+  const timeframe = toText(searchParams.get("dashboardTimeframe")).toLowerCase();
+  if (timeframe === "mtd") {
+    return "mtd";
+  }
+  if (timeframe === "quarter") {
+    return "quarter";
+  }
+  if (timeframe === "ytd" || timeframe === "annual" || timeframe === "fy") {
+    return "ytd";
+  }
+  return "monthly";
+}
+
+function resolveInitialMonth(searchParams: URLSearchParams, fallbackMonth: string) {
+  const monthFromSearch = monthKey(
+    toText(searchParams.get("dashboardMonth")) ||
+      toText(searchParams.get("periodTo")),
+  );
+  return monthFromSearch || fallbackMonth;
+}
+
+function resolveInitialQuarter(searchParams: URLSearchParams, fallbackMonth: string) {
+  const searchQuarter = toText(searchParams.get("dashboardQuarter")).toUpperCase();
+  if (searchQuarter === "Q1" || searchQuarter === "Q2" || searchQuarter === "Q3" || searchQuarter === "Q4") {
+    return searchQuarter;
+  }
+  return quarterFromMonth(fallbackMonth);
+}
+
+function includeRowForPeriod(
+  row: TrendSummaryRow,
+  period: PeriodView,
+  selectedMonth: string,
+  selectedQuarter: string,
+  latestMonth: string,
+) {
+  const rowMonthIndex = monthIndex(row.month);
+  if (rowMonthIndex < 0) {
+    return false;
+  }
+  const selectedIndex = monthIndex(selectedMonth);
+  const latestIndex = monthIndex(latestMonth);
+  if (period === "mtd") {
+    return rowMonthIndex === latestIndex;
+  }
+  if (period === "monthly") {
+    return rowMonthIndex === selectedIndex;
+  }
+  if (period === "quarter") {
+    const quarter = toText(row.quarter).toUpperCase() || quarterFromMonth(row.month);
+    return quarter === selectedQuarter;
+  }
+  return rowMonthIndex <= selectedIndex;
+}
+
+function buildDimensionRows(
+  rows: TrendSummaryRow[],
+  key: DimensionKey,
+  period: PeriodView,
+  selectedMonth: string,
+  selectedQuarter: string,
+  latestMonth: string,
+) {
+  const map = new Map<string, DimensionRow>();
+  for (const row of rows) {
+    if (!includeRowForPeriod(row, period, selectedMonth, selectedQuarter, latestMonth)) {
+      continue;
+    }
+    const label = toText(row[key]) || "Unassigned";
+    const bucket = map.get(label) ?? { label, budget: 0, actual: 0, variance: 0 };
+    bucket.budget += toNumber(row.budget);
+    bucket.actual += toNumber(row.actual);
+    bucket.variance += toNumber(row.variance);
+    map.set(label, bucket);
+  }
+  const sorted = Array.from(map.values()).sort((left, right) => right.actual - left.actual);
+  const grandTotal = sorted.reduce(
+    (accumulator, row) => {
+      accumulator.budget += row.budget;
+      accumulator.actual += row.actual;
+      accumulator.variance += row.variance;
+      return accumulator;
+    },
+    { label: "Grand Total", budget: 0, actual: 0, variance: 0 },
+  );
+  return {
+    rows: sorted,
+    tableRows: [...sorted, grandTotal],
+  };
+}
+
+function describePeriod(period: PeriodView, month: string, quarter: string) {
+  if (period === "mtd") {
+    return `MTD view (${month})`;
+  }
+  if (period === "quarter") {
+    return `Quarter view (${quarter})`;
+  }
+  if (period === "ytd") {
+    return `YTD view (Apr-${month})`;
+  }
+  return `Monthly view (${month})`;
+}
+
+function DimensionSection({
+  dimensionKey,
+  title,
+  rows,
+  tableRows,
+  chartMode,
+  period,
+  selectedMonth,
+  selectedQuarter,
+  latestMonth,
+  financialYear,
+  globalFilters,
+  onOpenDetails,
+  onChartModeChange,
+}: {
+  dimensionKey: DimensionKey;
+  title: string;
+  rows: DimensionRow[];
+  tableRows: DimensionRow[];
+  chartMode: "graph" | "table";
+  period: PeriodView;
+  selectedMonth: string;
+  selectedQuarter: string;
+  latestMonth: string;
+  financialYear: string;
+  globalFilters: Record<string, unknown>;
+  onOpenDetails: (options: {
+    dimensionKey: DimensionKey;
+    label: string;
+    metric: "budget" | "actual" | "variance";
+    value: number;
+    title: string;
+    period: PeriodView;
+    selectedMonth: string;
+    selectedQuarter: string;
+    latestMonth: string;
+    financialYear: string;
+    globalFilters: Record<string, unknown>;
+  }) => void;
+  onChartModeChange: (value: "graph" | "table") => void;
+}) {
+  return (
+    <article className="overflow-hidden rounded-[22px] border border-slate-200 bg-white p-4 shadow-[0_10px_26px_rgba(15,23,42,0.08)]">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <h2 className="text-base font-semibold text-slate-950">{title}</h2>
+        <div className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 p-1">
+          <button
+            type="button"
+            onClick={() => onChartModeChange("graph")}
+            className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+              chartMode === "graph" ? "bg-slate-950 text-white" : "text-slate-600"
+            }`}
+          >
+            <BarChart3 className="h-3.5 w-3.5" />
+            Graph
+          </button>
+          <button
+            type="button"
+            onClick={() => onChartModeChange("table")}
+            className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+              chartMode === "table" ? "bg-slate-950 text-white" : "text-slate-600"
+            }`}
+          >
+            <Table2 className="h-3.5 w-3.5" />
+            Table
+          </button>
+        </div>
+      </div>
+
+      {chartMode === "graph" ? (
+        <div className="h-[310px] rounded-xl border border-slate-200 bg-slate-50/40 px-2 py-2">
+          {rows.length === 0 ? (
+            <div className="flex h-full items-center justify-center text-sm font-semibold text-slate-500">
+              No data available for this period
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={rows.slice(0, 12)} margin={{ top: 8, right: 12, left: 0, bottom: 42 }}>
+                <CartesianGrid stroke="#dbe3f0" strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="label"
+                  tick={{ fontSize: 10 }}
+                  angle={-22}
+                  textAnchor="end"
+                  interval={0}
+                  height={44}
+                />
+                <YAxis tick={{ fontSize: 10 }} tickFormatter={(value) => formatCompactCurrency(toNumber(value))} width={72} />
+                <Tooltip formatter={(value: unknown) => formatCurrency(toNumber(value))} />
+                <Legend wrapperStyle={{ fontSize: "11px" }} />
+                <Bar
+                  dataKey="budget"
+                  name="Budget"
+                  fill={CORPORATE_COLORS.budget}
+                  radius={[4, 4, 0, 0]}
+                  onClick={(state: any) => {
+                    const label = toText(state?.payload?.label);
+                    if (!label) {
+                      return;
+                    }
+                    onOpenDetails({
+                      dimensionKey,
+                      label,
+                      metric: "budget",
+                      value: toNumber(state?.payload?.budget),
+                      title,
+                      period,
+                      selectedMonth,
+                      selectedQuarter,
+                      latestMonth,
+                      financialYear,
+                      globalFilters,
+                    });
+                  }}
+                />
+                <Bar
+                  dataKey="actual"
+                  name="Actuals"
+                  fill={CORPORATE_COLORS.actual}
+                  radius={[4, 4, 0, 0]}
+                  onClick={(state: any) => {
+                    const label = toText(state?.payload?.label);
+                    if (!label) {
+                      return;
+                    }
+                    onOpenDetails({
+                      dimensionKey,
+                      label,
+                      metric: "actual",
+                      value: toNumber(state?.payload?.actual),
+                      title,
+                      period,
+                      selectedMonth,
+                      selectedQuarter,
+                      latestMonth,
+                      financialYear,
+                      globalFilters,
+                    });
+                  }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="variance"
+                  name="Variance"
+                  stroke={CORPORATE_COLORS.variance}
+                  strokeWidth={2}
+                  dot={false}
+                  onClick={(state: any) => {
+                    const label = toText(state?.payload?.label);
+                    if (!label) {
+                      return;
+                    }
+                    onOpenDetails({
+                      dimensionKey,
+                      label,
+                      metric: "variance",
+                      value: toNumber(state?.payload?.variance),
+                      title,
+                      period,
+                      selectedMonth,
+                      selectedQuarter,
+                      latestMonth,
+                      financialYear,
+                      globalFilters,
+                    });
+                  }}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      ) : (
+        <div className="table-freeze-shell rounded-xl border border-slate-200">
+          <table className="min-w-full text-left text-xs text-slate-700">
+            <thead className="sticky top-0 z-10 bg-slate-950 text-white">
+              <tr>
+                <th className="px-3 py-2.5 font-semibold uppercase tracking-[0.14em]">No</th>
+                <th className="px-3 py-2.5 font-semibold uppercase tracking-[0.14em]">Label</th>
+                <th className="px-3 py-2.5 text-right font-semibold uppercase tracking-[0.14em]">Budget</th>
+                <th className="px-3 py-2.5 text-right font-semibold uppercase tracking-[0.14em]">Actuals</th>
+                <th className="px-3 py-2.5 text-right font-semibold uppercase tracking-[0.14em]">Variance</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tableRows.map((row, index) => {
+                const grandTotal = row.label.toLowerCase() === "grand total";
+                return (
+                  <tr
+                    key={`${row.label}-${index}`}
+                    className={`border-b border-slate-100 last:border-b-0 ${
+                      grandTotal ? "bg-slate-100 font-semibold" : index % 2 === 0 ? "bg-white" : "bg-slate-50/70"
+                    }`}
+                  >
+                    <td className="px-3 py-2.5 font-semibold text-slate-900">{index + 1}</td>
+                    <td className="px-3 py-2.5 text-slate-900">{row.label}</td>
+                    <td
+                      className={`px-3 py-2.5 text-right tabular-nums ${
+                        grandTotal ? "" : "cursor-pointer underline decoration-dotted"
+                      }`}
+                      onClick={() => {
+                        if (grandTotal) {
+                          return;
+                        }
+                        onOpenDetails({
+                          dimensionKey,
+                          label: row.label,
+                          metric: "budget",
+                          value: row.budget,
+                          title,
+                          period,
+                          selectedMonth,
+                          selectedQuarter,
+                          latestMonth,
+                          financialYear,
+                          globalFilters,
+                        });
+                      }}
+                    >
+                      {formatCurrency(row.budget)}
+                    </td>
+                    <td
+                      className={`px-3 py-2.5 text-right tabular-nums ${
+                        grandTotal ? "" : "cursor-pointer underline decoration-dotted"
+                      }`}
+                      onClick={() => {
+                        if (grandTotal) {
+                          return;
+                        }
+                        onOpenDetails({
+                          dimensionKey,
+                          label: row.label,
+                          metric: "actual",
+                          value: row.actual,
+                          title,
+                          period,
+                          selectedMonth,
+                          selectedQuarter,
+                          latestMonth,
+                          financialYear,
+                          globalFilters,
+                        });
+                      }}
+                    >
+                      {formatCurrency(row.actual)}
+                    </td>
+                    <td
+                      className={`px-3 py-2.5 text-right tabular-nums ${
+                        grandTotal ? "" : "cursor-pointer underline decoration-dotted"
+                      }`}
+                      onClick={() => {
+                        if (grandTotal) {
+                          return;
+                        }
+                        onOpenDetails({
+                          dimensionKey,
+                          label: row.label,
+                          metric: "variance",
+                          value: row.variance,
+                          title,
+                          period,
+                          selectedMonth,
+                          selectedQuarter,
+                          latestMonth,
+                          financialYear,
+                          globalFilters,
+                        });
+                      }}
+                    >
+                      {formatCurrency(row.variance)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </article>
+  );
+}
+
+export function TrendsComparisonDashboard() {
+  const searchParams = useSearchParams();
+  const { openDrillDown } = useDrillDown();
+  const [rows, setRows] = useState<TrendSummaryRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [viewByDimension, setViewByDimension] = useState<Record<DimensionKey, "graph" | "table">>({
+    vertical: "graph",
+    horizontal: "graph",
+    region: "graph",
+    msps: "graph",
+  });
+
+  const financialYear = DEFAULT_FINANCIAL_YEAR;
+  const globalFilters = useMemo(() => {
+    const mapping: Record<string, string> = {
+      practices: "practice_head",
+      practiceHeads: "practice_head",
+      geoHeads: "geo_head",
+      bdms: "bdm",
+      verticals: "vertical",
+      horizontals: "horizontal",
+      regions: "region",
+      rowUs: "row_us",
+      accounts: "customer_name",
+      customerNames: "customer_name",
+      projectNames: "project_name",
+      dealTypes: "deal_type",
+      msps: "ms_ps",
+      strategicAccounts: "strategic_account",
+      salesRegions: "sales_region",
+    };
+    const resolved: Record<string, unknown> = {};
+    for (const [queryKey, filterKey] of Object.entries(mapping)) {
+      const values = searchParams.getAll(queryKey).map((value) => value.trim()).filter(Boolean);
+      if (values.length === 1) {
+        resolved[filterKey] = values[0];
+      } else if (values.length > 1) {
+        resolved[filterKey] = values;
+      }
+    }
+    return resolved;
+  }, [searchParams]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function loadSummary() {
+      setLoading(true);
+      setError(null);
+      try {
+        const query = new URLSearchParams(searchParams.toString());
+        query.set("financialYear", financialYear);
+        query.set("periodFrom", "Apr");
+        query.set("periodTo", "Mar");
+        const response = await fetch(`/api/trends/summary?${query.toString()}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        const body = (await response.json().catch(() => null)) as
+          | { rows?: TrendSummaryRow[]; detail?: string }
+          | null;
+        if (!response.ok || !body) {
+          throw new Error(body?.detail || "Unable to load trends summary.");
+        }
+        setRows(Array.isArray(body.rows) ? body.rows : []);
+      } catch (loadError) {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setRows([]);
+        setError(
+          loadError instanceof Error ? loadError.message : "Unable to load trends summary.",
+        );
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    void loadSummary();
+    return () => controller.abort();
+  }, [financialYear, searchParams]);
+
+  const availableMonths = useMemo(() => {
+    const values = Array.from(
+      new Set(
+        rows
+          .map((row) => monthKey(row.month))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    ).sort((left, right) => MONTH_INDEX[left] - MONTH_INDEX[right]);
+    return values.length > 0 ? values : [...MONTH_ORDER];
+  }, [rows]);
+
+  const latestMonth = availableMonths.at(-1) ?? "Mar";
+  const period = useMemo(() => resolveInitialPeriod(searchParams), [searchParams]);
+  const selectedMonth = useMemo(() => {
+    const initial = resolveInitialMonth(searchParams, latestMonth);
+    return availableMonths.includes(initial) ? initial : latestMonth;
+  }, [availableMonths, latestMonth, searchParams]);
+  const selectedQuarter = useMemo(
+    () => resolveInitialQuarter(searchParams, selectedMonth),
+    [searchParams, selectedMonth],
+  );
+
+  const sections = useMemo(() => {
+    return DIMENSIONS.map((dimension) => {
+      const { rows: dimensionRows, tableRows } = buildDimensionRows(
+        rows,
+        dimension.key,
+        period,
+        selectedMonth,
+        selectedQuarter,
+        latestMonth,
+      );
+      return {
+        ...dimension,
+        rows: dimensionRows,
+        tableRows,
+      };
+    });
+  }, [latestMonth, period, rows, selectedMonth, selectedQuarter]);
+
+  function openTrendDrillDown(options: {
+    dimensionKey: DimensionKey;
+    label: string;
+    metric: "budget" | "actual" | "variance";
+    value: number;
+    title: string;
+    period: PeriodView;
+    selectedMonth: string;
+    selectedQuarter: string;
+    latestMonth: string;
+    financialYear: string;
+    globalFilters: Record<string, unknown>;
+  }) {
+    const filterKeyByDimension: Record<DimensionKey, string> = {
+      vertical: "vertical",
+      horizontal: "horizontal",
+      region: "region",
+      msps: "ms_ps",
+    };
+    const periodFilters: Record<string, unknown> = {};
+    if (options.period === "mtd") {
+      periodFilters.month = options.latestMonth;
+    } else if (options.period === "monthly") {
+      periodFilters.month = options.selectedMonth;
+    } else if (options.period === "quarter") {
+      periodFilters.quarter = options.selectedQuarter;
+    } else {
+      const endIndex = MONTH_INDEX[options.selectedMonth] ?? MONTH_INDEX.Mar;
+      periodFilters.month = MONTH_ORDER.slice(0, endIndex + 1);
+    }
+    const source = options.metric === "variance" ? "variance" : "combined";
+    openDrillDown({
+      source,
+      metric: options.metric === "actual" ? "actual" : options.metric,
+      value: options.value,
+      fiscalYear: options.financialYear,
+      filters: {
+        ...options.globalFilters,
+        [filterKeyByDimension[options.dimensionKey]]: options.label,
+        ...periodFilters,
+      },
+      aggregation: {
+        type: "sum",
+        field: options.metric === "actual" ? "actual" : options.metric,
+      },
+      displayTitle: `Underlying Records - ${options.title} / ${options.label} / ${options.metric.toUpperCase()}`,
+    });
+  }
+
+  if (loading) {
+    return (
+      <section className="rounded-[24px] border border-slate-200 bg-white px-6 py-8 shadow-[0_14px_34px_rgba(15,23,42,0.08)]">
+        <div className="flex items-center gap-3 text-sm font-semibold text-slate-600">
+          <LoaderCircle className="h-5 w-5 animate-spin" />
+          Loading trends comparison...
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      <section className="rounded-[24px] border border-slate-200 bg-white px-6 py-6 shadow-[0_14px_34px_rgba(15,23,42,0.08)]">
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#0d5a8a]">
+              Trends Comparison
+            </p>
+            <h1 className="mt-2 text-2xl font-semibold text-slate-950">
+              Budget vs Actuals ({financialYear})
+            </h1>
+            <p className="mt-2 text-sm text-slate-600">
+              Graphs are default. Use the table icon inside each section when needed.
+            </p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
+            {describePeriod(period, selectedMonth, selectedQuarter)}
+          </div>
+        </div>
+        {error ? (
+          <div className="mt-4 rounded-[16px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            {error}
+          </div>
+        ) : null}
+      </section>
+
+      {sections.map((section) => (
+        <DimensionSection
+          key={section.key}
+          dimensionKey={section.key}
+          title={section.title}
+          rows={section.rows}
+          tableRows={section.tableRows}
+          chartMode={viewByDimension[section.key]}
+          period={period}
+          selectedMonth={selectedMonth}
+          selectedQuarter={selectedQuarter}
+          latestMonth={latestMonth}
+          financialYear={financialYear}
+          globalFilters={globalFilters}
+          onOpenDetails={openTrendDrillDown}
+          onChartModeChange={(value) =>
+            setViewByDimension((current) => ({
+              ...current,
+              [section.key]: value,
+            }))
+          }
+        />
+      ))}
+    </div>
+  );
+}

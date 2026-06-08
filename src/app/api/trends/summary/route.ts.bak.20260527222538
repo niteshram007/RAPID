@@ -1,0 +1,69 @@
+import { NextRequest, NextResponse } from "next/server";
+
+import { getSessionProfile } from "@/lib/auth";
+import { buildBackendAuthHeaders } from "@/lib/backend-security";
+import { hasPermission } from "@/lib/rbac-store";
+
+const BACKEND_API_URL = process.env.BACKEND_API_URL ?? "http://127.0.0.1:8000";
+const DEFAULT_FINANCIAL_YEAR = "2025-2026";
+
+type TrendSummaryResponse = {
+  rows?: unknown[];
+  count?: number;
+  lastUpdated?: string | null;
+  detail?: string;
+};
+
+async function fetchTrendSummary(
+  request: NextRequest,
+  financialYear: string,
+  session: NonNullable<Awaited<ReturnType<typeof getSessionProfile>>>,
+) {
+  const search = new URLSearchParams(request.nextUrl.searchParams.toString());
+  search.set("financialYear", financialYear);
+  const response = await fetch(`${BACKEND_API_URL}/api/trends/summary?${search.toString()}`, {
+    cache: "no-store",
+    headers: buildBackendAuthHeaders(session, undefined, request),
+  });
+  const body = (await response.json().catch(() => ({}))) as TrendSummaryResponse;
+  return { response, body };
+}
+
+export async function GET(request: NextRequest) {
+  const session = await getSessionProfile();
+  if (!session) {
+    return NextResponse.json({ detail: "Unauthorized" }, { status: 401 });
+  }
+  if (!hasPermission(session.role, "view_dashboard")) {
+    return NextResponse.json({ detail: "Forbidden" }, { status: 403 });
+  }
+
+  const financialYear =
+    request.nextUrl.searchParams.get("financialYear")?.trim() || DEFAULT_FINANCIAL_YEAR;
+
+  const initial = await fetchTrendSummary(request, financialYear, session);
+  if (!initial.response.ok) {
+    return NextResponse.json(initial.body, { status: initial.response.status });
+  }
+
+  const rows = Array.isArray(initial.body.rows) ? initial.body.rows : [];
+  if (rows.length > 0) {
+    return NextResponse.json(initial.body, { status: 200 });
+  }
+
+  await fetch(`${BACKEND_API_URL}/api/trends/refresh`, {
+    method: "POST",
+    cache: "no-store",
+    headers: buildBackendAuthHeaders(
+      session,
+      {
+        "Content-Type": "application/json",
+      },
+      request,
+    ),
+    body: JSON.stringify({ financialYear }),
+  }).catch(() => null);
+
+  const refreshed = await fetchTrendSummary(request, financialYear, session);
+  return NextResponse.json(refreshed.body, { status: refreshed.response.status });
+}

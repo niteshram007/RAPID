@@ -1,0 +1,496 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { CheckCheck, ChevronDown, SlidersHorizontal, X } from "lucide-react";
+
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+
+type SlicerField = {
+  key:
+    | "customerNames"
+    | "msps"
+    | "rowUs"
+    | "entities"
+    | "strategicAccounts"
+    | "dealTypes"
+    | "eeennns"
+    | "projectNames"
+    | "practiceHeads"
+    | "bdms"
+    | "geoHeads"
+    | "verticals"
+    | "horizontals";
+  label: string;
+};
+
+type SlicerSelection = Record<SlicerField["key"], string[]>;
+type SlicerOptions = Record<SlicerField["key"], string[]>;
+
+const STORAGE_KEY = "rapid-global-slicer-v2";
+const SLICER_FIELDS: SlicerField[] = [
+  { key: "geoHeads", label: "Geo Head" },
+  { key: "bdms", label: "BDM" },
+  { key: "eeennns", label: "EE-EN-NN" },
+  { key: "dealTypes", label: "Deal Type" },
+  { key: "strategicAccounts", label: "Strategic Account" },
+  { key: "customerNames", label: "Customer Name" },
+  { key: "msps", label: "MS/PS" },
+  { key: "rowUs", label: "ROW/US" },
+  { key: "entities", label: "Entity" },
+  { key: "projectNames", label: "Project Name" },
+  { key: "practiceHeads", label: "Practice Head" },
+  { key: "verticals", label: "Vertical" },
+  { key: "horizontals", label: "Horizontal" },
+];
+
+function createEmptySelection(): SlicerSelection {
+  return SLICER_FIELDS.reduce<SlicerSelection>(
+    (selection, field) => ({
+      ...selection,
+      [field.key]: [],
+    }),
+    {} as SlicerSelection,
+  );
+}
+
+function normalizeText(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+async function fetchSlicerOptions(searchParams: URLSearchParams) {
+  const scopedSearch = new URLSearchParams(searchParams.toString());
+  scopedSearch.delete("customerNames");
+  scopedSearch.delete("projectNames");
+  const query = scopedSearch.toString();
+  const response = await fetch(
+    `/api/revenue/slicer-options${query ? `?${query}` : ""}`,
+    { cache: "no-store" },
+  );
+  if (!response.ok) {
+    throw new Error("Unable to load slicer values.");
+  }
+  return ((await response.json()) as SlicerOptions) ?? createEmptySelection();
+}
+
+function readSelection(searchParams: URLSearchParams): SlicerSelection {
+  const selection = createEmptySelection();
+  for (const field of SLICER_FIELDS) {
+    selection[field.key] = searchParams
+      .getAll(field.key)
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+  return selection;
+}
+
+function hasSelectedValues(selection: SlicerSelection) {
+  return Object.values(selection).some((values) => values.length > 0);
+}
+
+function areAllValuesSelected(selectedValues: string[], options: string[]) {
+  if (options.length === 0) {
+    return selectedValues.length === 0;
+  }
+  if (selectedValues.length !== options.length) {
+    return false;
+  }
+  const selectedSet = new Set(selectedValues.map((value) => normalizeText(value)));
+  return options.every((option) => selectedSet.has(normalizeText(option)));
+}
+
+function buildDraftSelection(
+  selection: SlicerSelection,
+  optionsByField: SlicerOptions,
+): SlicerSelection {
+  const next = createEmptySelection();
+  for (const field of SLICER_FIELDS) {
+    const selected = selection[field.key] ?? [];
+    const options = optionsByField[field.key] ?? [];
+    next[field.key] = selected.length > 0 ? selected : [...options];
+  }
+  return next;
+}
+
+export function WorkspaceGlobalSlicer() {
+  const pathname = usePathname();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [optionsByField, setOptionsByField] = useState<SlicerOptions | null>(null);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [draftSelection, setDraftSelection] = useState<SlicerSelection>(createEmptySelection);
+  const [expandedFields, setExpandedFields] = useState<Record<SlicerField["key"], boolean>>(() =>
+    SLICER_FIELDS.reduce(
+      (accumulator, field) => ({
+        ...accumulator,
+        [field.key]: false,
+      }),
+      {} as Record<SlicerField["key"], boolean>,
+    ),
+  );
+  const restoredForLocationRef = useRef<string>("");
+  const searchParamsKey = searchParams.toString();
+
+  const isWorkspacePath =
+    pathname.startsWith("/executive") ||
+    pathname.startsWith("/bdm") ||
+    pathname.startsWith("/geo-head") ||
+    pathname.startsWith("/practice-head") ||
+    pathname.startsWith("/buh");
+
+  const selectedByField = useMemo(
+    () => readSelection(new URLSearchParams(searchParamsKey)),
+    [searchParamsKey],
+  );
+  const selectedCount = useMemo(
+    () => Object.values(selectedByField).reduce((sum, values) => sum + values.length, 0),
+    [selectedByField],
+  );
+  const hasExplicitSelection = useMemo(
+    () => hasSelectedValues(selectedByField),
+    [selectedByField],
+  );
+  const selectedBadge = hasExplicitSelection ? String(selectedCount) : "All";
+  const resolvedOptions = optionsByField ?? createEmptySelection();
+  const hasExplicitUrlState = searchParamsKey.trim().length > 0;
+
+  useEffect(() => {
+    if (!isWorkspacePath || typeof window === "undefined") {
+      return;
+    }
+    if (hasSelectedValues(selectedByField)) {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(selectedByField));
+    } else {
+      window.localStorage.removeItem(STORAGE_KEY);
+    }
+  }, [isWorkspacePath, selectedByField]);
+
+  useEffect(() => {
+    if (!open) {
+      setDraftSelection(selectedByField);
+      return;
+    }
+    if (!optionsByField) {
+      setDraftSelection(selectedByField);
+      return;
+    }
+    setDraftSelection(buildDraftSelection(selectedByField, optionsByField));
+  }, [open, optionsByField, selectedByField]);
+
+  useEffect(() => {
+    if (!isWorkspacePath || typeof window === "undefined") {
+      return;
+    }
+    const locationKey = `${pathname}?${searchParamsKey}`;
+    if (restoredForLocationRef.current === locationKey) {
+      return;
+    }
+    restoredForLocationRef.current = locationKey;
+    if (!hasExplicitUrlState && !hasSelectedValues(selectedByField)) {
+      window.localStorage.removeItem(STORAGE_KEY);
+    }
+  }, [hasExplicitUrlState, isWorkspacePath, pathname, searchParamsKey, selectedByField]);
+
+  async function ensureLoaded() {
+    if (loading) {
+      return;
+    }
+    setLoading(true);
+    setLoadError(null);
+    try {
+      setOptionsByField(await fetchSlicerOptions(new URLSearchParams(searchParamsKey)));
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Unable to load slicer values.");
+      setOptionsByField(createEmptySelection());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function applyDraftSelection() {
+    const next = new URLSearchParams(searchParams.toString());
+    for (const field of SLICER_FIELDS) {
+      next.delete(field.key);
+      const selectedValues = draftSelection[field.key] ?? [];
+      const options = resolvedOptions[field.key] ?? [];
+      if (areAllValuesSelected(selectedValues, options)) {
+        continue;
+      }
+      for (const value of selectedValues) {
+        next.append(field.key, value);
+      }
+    }
+    const query = next.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+    setOpen(false);
+  }
+
+  function clearAllSlicerFilters() {
+    const next = new URLSearchParams(searchParams.toString());
+    for (const field of SLICER_FIELDS) {
+      next.delete(field.key);
+    }
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(STORAGE_KEY);
+    }
+    setDraftSelection(createEmptySelection());
+    const query = next.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+    setOpen(false);
+  }
+
+  function toggleValue(fieldKey: SlicerField["key"], value: string) {
+    setDraftSelection((current) => {
+      const currentValues = current[fieldKey] ?? [];
+      const exists = currentValues.some(
+        (entry) => normalizeText(entry) === normalizeText(value),
+      );
+      return {
+        ...current,
+        [fieldKey]: exists
+          ? currentValues.filter((entry) => normalizeText(entry) !== normalizeText(value))
+          : [...currentValues, value],
+      };
+    });
+  }
+
+  function selectAll(fieldKey: SlicerField["key"]) {
+    setDraftSelection((current) => ({
+      ...current,
+      [fieldKey]: resolvedOptions[fieldKey] ?? [],
+    }));
+  }
+
+  function clearField(fieldKey: SlicerField["key"]) {
+    setDraftSelection((current) => ({
+      ...current,
+      [fieldKey]: [],
+    }));
+  }
+
+  function openExclusiveField(fieldKey: SlicerField["key"]) {
+    setExpandedFields((current) => {
+      const isAlreadyOpen = Boolean(current[fieldKey]);
+      return SLICER_FIELDS.reduce(
+        (accumulator, field) => ({
+          ...accumulator,
+          [field.key]: field.key === fieldKey ? !isAlreadyOpen : false,
+        }),
+        {} as Record<SlicerField["key"], boolean>,
+      );
+    });
+  }
+
+  if (!isWorkspacePath) {
+    return null;
+  }
+
+  return (
+    <div className="relative z-[65] flex items-center">
+      <Popover
+        open={open}
+        onOpenChange={(next) => {
+          setOpen(next);
+          if (next) {
+            void ensureLoaded();
+          }
+        }}
+      >
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className={`inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full border border-slate-950 bg-white/94 px-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-950 shadow-[0_14px_30px_rgba(15,23,42,0.1)] backdrop-blur-2xl transition hover:-translate-y-0.5 hover:border-slate-800 ${
+              open ? "border-slate-800" : ""
+            }`}
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5" />
+            Slicer
+            <span
+              className="rounded-full border border-slate-300 bg-slate-950 px-1.5 py-0.5 text-[9.5px] font-semibold text-white"
+            >
+              {selectedBadge}
+            </span>
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          align="end"
+          side="bottom"
+          sideOffset={12}
+          className="w-[min(92vw,22rem)] rounded-[30px] border border-white/80 bg-white/84 p-0 shadow-[0_24px_60px_rgba(15,23,42,0.16)] backdrop-blur-2xl"
+        >
+          <div className="flex max-h-[78vh] flex-col overflow-hidden">
+            <div className="border-b border-slate-200 px-4 py-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-semibold text-[#024a70]">Workspace slicer</h3>
+                  <p className="mt-1 text-xs text-[#024a70]/70">
+                    Expand a header to choose values.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOpen(false)}
+                  className="rounded-full border border-slate-200 bg-white p-2 text-slate-500 hover:border-slate-300 hover:text-slate-900"
+                  aria-label="Close slicer"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-4 py-4">
+              {loading ? (
+                <div className="rounded-[18px] border border-dashed border-slate-200 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                  Loading slicer values...
+                </div>
+              ) : loadError ? (
+                <div className="rounded-[18px] border border-rose-200 bg-rose-50 px-4 py-6 text-sm text-rose-700">
+                  {loadError}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {SLICER_FIELDS.map((field) => {
+                    const selected = draftSelection[field.key] ?? [];
+                    const options = resolvedOptions[field.key] ?? [];
+                    const isExpanded = Boolean(expandedFields[field.key]);
+                    return (
+                      <section
+                        key={field.key}
+                        className="overflow-hidden rounded-[24px] border border-slate-200 bg-white"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => openExclusiveField(field.key)}
+                          onMouseEnter={() => openExclusiveField(field.key)}
+                          onFocus={() => openExclusiveField(field.key)}
+                          className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-slate-50"
+                        >
+                          <div>
+                            <p className="text-sm font-semibold text-[#024a70]">{field.label}</p>
+                            <p className="text-xs text-[#024a70]/70">
+                              {options.length === 0
+                                ? "No values"
+                                : selected.length > 0
+                                  ? `${selected.length} selected`
+                                  : "No filter"}
+                            </p>
+                          </div>
+                          <ChevronDown
+                            className={`h-4 w-4 text-slate-500 transition-transform ${
+                              isExpanded ? "rotate-180" : ""
+                            }`}
+                          />
+                        </button>
+                        {isExpanded ? (
+                          <div className="border-t border-slate-100 bg-slate-50/60 px-3 py-3">
+                            <div className="mb-3 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => selectAll(field.key)}
+                                disabled={options.length === 0}
+                                className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                Select all
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => clearField(field.key)}
+                                disabled={selected.length === 0}
+                                className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                Clear all
+                              </button>
+                            </div>
+                            <div className="max-h-52 overflow-y-auto">
+                              {options.length === 0 ? (
+                                <p className="rounded-2xl bg-slate-50 px-3 py-3 text-xs text-slate-400">
+                                  No values in this slice.
+                                </p>
+                              ) : (
+                                <div className="grid gap-1">
+                                  {options.map((value) => {
+                                    const isChecked = selected.some(
+                                      (entry) =>
+                                        normalizeText(entry) === normalizeText(value),
+                                    );
+                                    const useMarquee = value.length > 20;
+                                    return (
+                                      <label
+                                        key={`${field.key}-${value}`}
+                                        className={`flex items-center gap-3 rounded-2xl border px-3 py-2 text-sm transition ${
+                                          isChecked
+                                            ? "border-[#b8e6fe] bg-[#eff8ff] text-[#024a70]"
+                                            : "border-slate-200 bg-white text-[#024a70] hover:border-[#b8e6fe]"
+                                        }`}
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={isChecked}
+                                          onChange={() => toggleValue(field.key, value)}
+                                          className="h-4 w-4 rounded border-slate-300"
+                                          style={{ accentColor: "#0f7cff" }}
+                                        />
+                                        <span
+                                          className="block max-w-[12.5rem] overflow-hidden whitespace-nowrap"
+                                          title={value}
+                                        >
+                                          <span className={useMarquee ? "marquee-text" : ""}>
+                                            {value}
+                                          </span>
+                                        </span>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ) : null}
+                      </section>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-slate-200 bg-white px-4 py-4">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-xs text-slate-500">
+                  {selectedCount > 0
+                    ? `${selectedCount} slicer values applied.`
+                    : "No slicer filters applied."}
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    type="button"
+                    onClick={clearAllSlicerFilters}
+                    className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:border-slate-300 hover:text-slate-950"
+                  >
+                    Clear all
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOpen(false)}
+                    className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:border-slate-300 hover:text-slate-950"
+                  >
+                    Close
+                  </button>
+                  <button
+                    type="button"
+                    onClick={applyDraftSelection}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-[#024a70] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#01324b]"
+                  >
+                    <CheckCheck className="h-3.5 w-3.5" />
+                    Submit
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </PopoverContent>
+      </Popover>
+    </div>
+  );
+}

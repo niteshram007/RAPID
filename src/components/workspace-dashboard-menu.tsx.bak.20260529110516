@@ -1,0 +1,731 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { ChartColumnIncreasing, CheckCheck, ChevronDown, X } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { getCurrentFinancialYear, getFinancialYears } from "@/lib/financial-years";
+
+type DashboardTimeframe = "annual" | "mtd" | "ytd" | "quarter";
+type DashboardQuarter = "Q1" | "Q2" | "Q3" | "Q4";
+type MtdMode = "current" | "prior" | "custom";
+type DialRing = "outer" | "inner";
+
+type DashboardDraftSelection = {
+  financialYear: string;
+  dashboardTimeframe: DashboardTimeframe;
+  dashboardMonth: FiscalMonth;
+  dashboardQuarter: DashboardQuarter;
+};
+
+type FiscalMonth = (typeof FISCAL_MONTH_OPTIONS)[number];
+type PrimaryDialMode = DashboardTimeframe;
+type OuterDialSelection = FiscalMonth | DashboardQuarter | "none";
+
+const FISCAL_MONTH_OPTIONS = [
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+  "Jan",
+  "Feb",
+  "Mar",
+] as const;
+
+const QUARTER_OPTIONS: DashboardQuarter[] = ["Q1", "Q2", "Q3", "Q4"];
+
+const QUARTER_MONTH_MAP: Record<DashboardQuarter, readonly FiscalMonth[]> = {
+  Q1: ["Apr", "May", "Jun"],
+  Q2: ["Jul", "Aug", "Sep"],
+  Q3: ["Oct", "Nov", "Dec"],
+  Q4: ["Jan", "Feb", "Mar"],
+};
+
+const PRIMARY_DIAL_SEGMENTS: Array<{ id: PrimaryDialMode; label: string }> = [
+  { id: "annual", label: "Annual" },
+  { id: "mtd", label: "MTD" },
+  { id: "ytd", label: "YTD" },
+  { id: "quarter", label: "Quarters" },
+];
+
+const STORAGE_KEY = "rapid-analytics-kiosk-v2";
+
+function resolveDashboardTimeframe(
+  value: string | null,
+  legacyQuarter: string | null,
+): DashboardTimeframe {
+  if (value === "annual" || value === "mtd" || value === "ytd" || value === "quarter") {
+    return value;
+  }
+  if (value === "fy") {
+    return "annual";
+  }
+  if (value === "q1" || value === "q2" || value === "q3" || value === "q4" || value === "quarter") {
+    return "quarter";
+  }
+  if (legacyQuarter === "Q1" || legacyQuarter === "Q2" || legacyQuarter === "Q3" || legacyQuarter === "Q4") {
+    return "quarter";
+  }
+  return "annual";
+}
+
+function resolveCurrentFiscalMonth(): FiscalMonth {
+  const shortMonth = new Intl.DateTimeFormat("en-US", { month: "short" }).format(new Date());
+  return FISCAL_MONTH_OPTIONS.includes(shortMonth as FiscalMonth)
+    ? (shortMonth as FiscalMonth)
+    : "Apr";
+}
+
+function resolveDashboardMonth(value: string | null | undefined): FiscalMonth {
+  const normalized = String(value ?? "").trim();
+  return FISCAL_MONTH_OPTIONS.includes(normalized as FiscalMonth)
+    ? (normalized as FiscalMonth)
+    : resolveCurrentFiscalMonth();
+}
+
+function quarterForMonth(month: FiscalMonth): DashboardQuarter {
+  if (QUARTER_MONTH_MAP.Q1.includes(month)) {
+    return "Q1";
+  }
+  if (QUARTER_MONTH_MAP.Q2.includes(month)) {
+    return "Q2";
+  }
+  if (QUARTER_MONTH_MAP.Q3.includes(month)) {
+    return "Q3";
+  }
+  return "Q4";
+}
+
+function resolveDashboardQuarter(
+  value: string | null | undefined,
+  legacyTimeframe: string | null,
+  month: FiscalMonth,
+): DashboardQuarter {
+  if (value === "Q1" || value === "Q2" || value === "Q3" || value === "Q4") {
+    return value;
+  }
+  if (legacyTimeframe === "q1") {
+    return "Q1";
+  }
+  if (legacyTimeframe === "q2") {
+    return "Q2";
+  }
+  if (legacyTimeframe === "q3") {
+    return "Q3";
+  }
+  if (legacyTimeframe === "q4") {
+    return "Q4";
+  }
+  return quarterForMonth(month);
+}
+
+function resolveValidFinancialYear(value: string | null | undefined, options: string[]) {
+  const normalized = String(value ?? "").trim();
+  if (normalized && options.includes(normalized)) {
+    return normalized;
+  }
+  const currentFinancialYear = getCurrentFinancialYear();
+  if (options.includes(currentFinancialYear)) {
+    return currentFinancialYear;
+  }
+  return options.at(-1) ?? currentFinancialYear;
+}
+
+function monthBefore(month: FiscalMonth) {
+  const currentIndex = FISCAL_MONTH_OPTIONS.indexOf(month);
+  if (currentIndex <= 0) {
+    return FISCAL_MONTH_OPTIONS[FISCAL_MONTH_OPTIONS.length - 1];
+  }
+  return FISCAL_MONTH_OPTIONS[currentIndex - 1];
+}
+
+function resolveMtdMode(rawMode: string | null, selection: DashboardDraftSelection): MtdMode {
+  if (rawMode === "current" || rawMode === "prior" || rawMode === "custom") {
+    return rawMode;
+  }
+  if (selection.dashboardTimeframe !== "mtd") {
+    return "current";
+  }
+  const currentMonth = resolveCurrentFiscalMonth();
+  if (selection.dashboardMonth === currentMonth) {
+    return "current";
+  }
+  if (selection.dashboardMonth === monthBefore(currentMonth)) {
+    return "prior";
+  }
+  return "custom";
+}
+
+function resolveMtdModeForMonth(month: FiscalMonth): MtdMode {
+  const currentMonth = resolveCurrentFiscalMonth();
+  if (month === currentMonth) {
+    return "current";
+  }
+  if (month === monthBefore(currentMonth)) {
+    return "prior";
+  }
+  return "custom";
+}
+
+function applyPeriodWindow(
+  next: URLSearchParams,
+  timeframe: DashboardTimeframe,
+  month: FiscalMonth,
+  quarter: DashboardQuarter,
+) {
+  next.delete("dashboardMonth");
+  next.delete("dashboardQuarter");
+
+  if (timeframe === "annual") {
+    next.set("periodFrom", "Apr");
+    next.set("periodTo", "Mar");
+    return;
+  }
+
+  if (timeframe === "quarter") {
+    const quarterMonths = QUARTER_MONTH_MAP[quarter];
+    next.set("dashboardQuarter", quarter);
+    next.set("periodFrom", quarterMonths[0]);
+    next.set("periodTo", quarterMonths[quarterMonths.length - 1]);
+    return;
+  }
+
+  next.set("dashboardMonth", month);
+  if (timeframe === "ytd") {
+    next.set("periodFrom", "Apr");
+    next.set("periodTo", month);
+    return;
+  }
+
+  next.set("periodFrom", month);
+  next.set("periodTo", month);
+}
+
+function formatTimeframeSummary(selection: DashboardDraftSelection) {
+  if (selection.dashboardTimeframe === "annual") {
+    return "Annual";
+  }
+  if (selection.dashboardTimeframe === "quarter") {
+    return selection.dashboardQuarter;
+  }
+  if (selection.dashboardTimeframe === "ytd") {
+    return `YTD ${selection.dashboardMonth}`;
+  }
+  return `MTD ${selection.dashboardMonth}`;
+}
+
+function resolveOuterSelection(selection: DashboardDraftSelection): OuterDialSelection {
+  if (selection.dashboardTimeframe === "annual") {
+    return "none";
+  }
+  if (selection.dashboardTimeframe === "quarter") {
+    return selection.dashboardQuarter;
+  }
+  return selection.dashboardMonth;
+}
+
+function outerSegmentsForTimeframe(
+  timeframe: DashboardTimeframe,
+): Array<{ id: OuterDialSelection; label: string }> {
+  if (timeframe === "annual") {
+    return [];
+  }
+  if (timeframe === "quarter") {
+    return QUARTER_OPTIONS.map((quarter) => ({ id: quarter, label: quarter }));
+  }
+  return FISCAL_MONTH_OPTIONS.map((month) => ({ id: month, label: month }));
+}
+
+function angleFromPoint(event: PointerEvent | ReactPointerEvent<HTMLElement>, bounds: DOMRect) {
+  const x = event.clientX - bounds.left - bounds.width / 2;
+  const y = event.clientY - bounds.top - bounds.height / 2;
+  const radius = Math.sqrt(x * x + y * y);
+  const angle = (Math.atan2(y, x) * (180 / Math.PI) + 90 + 360) % 360;
+  return { angle, radius };
+}
+
+function indexFromAngle(angle: number, segmentCount: number) {
+  const segmentSize = 360 / segmentCount;
+  return Math.round(angle / segmentSize) % segmentCount;
+}
+
+function RotatingWorkspaceDial({
+  timeframe,
+  outerSelection,
+  onTimeframeChange,
+  onOuterSelectionChange,
+}: {
+  timeframe: DashboardTimeframe;
+  outerSelection: OuterDialSelection;
+  onTimeframeChange: (next: DashboardTimeframe) => void;
+  onOuterSelectionChange: (next: Exclude<OuterDialSelection, "none">) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [dragRing, setDragRing] = useState<DialRing | null>(null);
+  const [dragAngle, setDragAngle] = useState(0);
+
+  const outerSegments = useMemo(() => outerSegmentsForTimeframe(timeframe), [timeframe]);
+  const innerIndex = Math.max(0, PRIMARY_DIAL_SEGMENTS.findIndex((segment) => segment.id === timeframe));
+  const outerIndex = Math.max(0, outerSegments.findIndex((segment) => segment.id === outerSelection));
+  const innerStep = 360 / PRIMARY_DIAL_SEGMENTS.length;
+  const outerStep = outerSegments.length > 0 ? 360 / outerSegments.length : 360;
+  const innerRotation = dragRing === "inner" ? -dragAngle : -(innerIndex * innerStep);
+  const outerRotation = dragRing === "outer" ? -dragAngle : -(outerIndex * outerStep);
+  const outerInteractive = outerSegments.length > 0;
+
+  function resolveRingFromRadius(radius: number): DialRing | null {
+    if (radius >= 108 && radius <= 146 && outerInteractive) {
+      return "outer";
+    }
+    if (radius >= 72 && radius < 108) {
+      return "inner";
+    }
+    return null;
+  }
+
+  function onPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    const node = containerRef.current;
+    if (!node) {
+      return;
+    }
+    const bounds = node.getBoundingClientRect();
+    const point = angleFromPoint(event, bounds);
+    const ring = resolveRingFromRadius(point.radius);
+    if (!ring) {
+      return;
+    }
+    node.setPointerCapture(event.pointerId);
+    setDragRing(ring);
+    setDragAngle(point.angle);
+  }
+
+  function onPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!dragRing || !containerRef.current) {
+      return;
+    }
+    const bounds = containerRef.current.getBoundingClientRect();
+    const point = angleFromPoint(event, bounds);
+    setDragAngle(point.angle);
+  }
+
+  function onPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!dragRing || !containerRef.current) {
+      return;
+    }
+    const bounds = containerRef.current.getBoundingClientRect();
+    const point = angleFromPoint(event, bounds);
+
+    if (dragRing === "inner") {
+      const nextIndex = indexFromAngle(point.angle, PRIMARY_DIAL_SEGMENTS.length);
+      onTimeframeChange(PRIMARY_DIAL_SEGMENTS[nextIndex].id);
+    } else if (outerSegments.length > 0) {
+      const nextIndex = indexFromAngle(point.angle, outerSegments.length);
+      const next = outerSegments[nextIndex].id;
+      if (next !== "none") {
+        onOuterSelectionChange(next);
+      }
+    }
+    setDragRing(null);
+  }
+
+  return (
+    <div
+      ref={containerRef}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={() => setDragRing(null)}
+      className="relative mx-auto h-[320px] w-[320px] touch-none select-none"
+    >
+      <div className="absolute inset-0 rounded-[32px] border border-white/80 bg-[linear-gradient(160deg,rgba(255,255,255,0.86),rgba(240,249,255,0.74),rgba(236,253,245,0.66))] shadow-[0_30px_70px_rgba(15,23,42,0.18)] backdrop-blur-2xl" />
+      <svg viewBox="0 0 320 320" className="absolute inset-0">
+        <defs>
+          <path
+            id="workspace-dial-outer-text"
+            d="M160 160 m -124 0 a124 124 0 1 1 248 0 a124 124 0 1 1 -248 0"
+          />
+          <path
+            id="workspace-dial-inner-text"
+            d="M160 160 m -90 0 a90 90 0 1 1 180 0 a90 90 0 1 1 -180 0"
+          />
+          <linearGradient id="workspace-dial-ring" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor="#d9e3ee" stopOpacity="0.95" />
+            <stop offset="100%" stopColor="#f3f7fc" stopOpacity="0.8" />
+          </linearGradient>
+        </defs>
+
+        <g transform={`rotate(${outerRotation} 160 160)`}>
+          <circle
+            cx="160"
+            cy="160"
+            r="124"
+            fill="url(#workspace-dial-ring)"
+            stroke="#ffffff"
+            strokeOpacity="0.85"
+            strokeWidth="1.4"
+          />
+          {outerSegments.length > 0 ? (
+            outerSegments.map((segment, index) => (
+              <text key={String(segment.id)} fill="#0f172a" fontSize="10.5" fontWeight="600" letterSpacing="0">
+                <textPath
+                  href="#workspace-dial-outer-text"
+                  startOffset={`${(index * 100) / outerSegments.length}%`}
+                >
+                  {segment.label}
+                </textPath>
+              </text>
+            ))
+          ) : (
+            <text x="160" y="52" textAnchor="middle" fill="#64748b" fontSize="10.5" fontWeight="600">
+              Outer Ring Disabled
+            </text>
+          )}
+        </g>
+
+        <g transform={`rotate(${innerRotation} 160 160)`}>
+          <circle cx="160" cy="160" r="90" fill="none" stroke="#d6e0ea" strokeWidth="24" />
+          <circle cx="160" cy="160" r="90" fill="none" stroke="#ffffff" strokeOpacity="0.58" strokeWidth="1.2" />
+          {PRIMARY_DIAL_SEGMENTS.map((segment, index) => (
+            <text key={segment.id} fill="#334155" fontSize="10" fontWeight="600" letterSpacing="0">
+              <textPath
+                href="#workspace-dial-inner-text"
+                startOffset={`${(index * 100) / PRIMARY_DIAL_SEGMENTS.length}%`}
+              >
+                {segment.label}
+              </textPath>
+            </text>
+          ))}
+        </g>
+      </svg>
+
+      <div className="absolute left-1/2 top-1/2 h-[126px] w-[126px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/85 bg-[conic-gradient(from_210deg,#dfe7ef_0deg,#f7fbff_65deg,#a9b8c8_140deg,#f8fbff_220deg,#cad4df_300deg,#eaf1f8_360deg)] shadow-[inset_0_10px_18px_rgba(255,255,255,0.85),inset_0_-14px_18px_rgba(15,23,42,0.16),0_10px_24px_rgba(15,23,42,0.18)]">
+        <div className="absolute left-1/2 top-2 h-3 w-3 -translate-x-1/2 rounded-full bg-sky-500 shadow-[0_0_16px_rgba(56,189,248,0.95)]" />
+        <div className="absolute left-1/2 top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full bg-slate-500" />
+      </div>
+    </div>
+  );
+}
+
+export function WorkspaceDashboardMenu() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const isWorkspacePath =
+    pathname.startsWith("/executive") ||
+    pathname.startsWith("/bdm") ||
+    pathname.startsWith("/geo-head") ||
+    pathname.startsWith("/practice-head") ||
+    pathname.startsWith("/buh");
+  const [open, setOpen] = useState(false);
+  const financialYearOptions = useMemo(() => getFinancialYears(2020, 2028), []);
+  const currentFinancialYear = useMemo(
+    () => resolveValidFinancialYear(getCurrentFinancialYear(), financialYearOptions),
+    [financialYearOptions],
+  );
+
+  const selectedMonth = resolveDashboardMonth(
+    searchParams.get("dashboardMonth")?.trim() || searchParams.get("periodTo")?.trim(),
+  );
+  const selectedTimeframe = resolveDashboardTimeframe(
+    searchParams.get("dashboardTimeframe"),
+    searchParams.get("dashboardQuarter"),
+  );
+  const selectedQuarter = resolveDashboardQuarter(
+    searchParams.get("dashboardQuarter"),
+    searchParams.get("dashboardTimeframe"),
+    selectedMonth,
+  );
+  const selectedFinancialYear = resolveValidFinancialYear(
+    searchParams.get("financialYear")?.trim() || searchParams.getAll("financialYears")[0]?.trim(),
+    financialYearOptions,
+  );
+
+  const currentSelection = useMemo(
+    () => ({
+      financialYear: selectedFinancialYear,
+      dashboardTimeframe: selectedTimeframe,
+      dashboardMonth: selectedMonth,
+      dashboardQuarter: selectedQuarter,
+    }),
+    [selectedFinancialYear, selectedMonth, selectedQuarter, selectedTimeframe],
+  );
+
+  const [draftSelection, setDraftSelection] = useState<DashboardDraftSelection>(currentSelection);
+  const [draftMtdMode, setDraftMtdMode] = useState<MtdMode>(() =>
+    resolveMtdMode(searchParams.get("dashboardMtdMode"), currentSelection),
+  );
+  const restoredForPathRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!isWorkspacePath || typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ ...currentSelection, dashboardMtdMode: draftMtdMode }),
+    );
+  }, [currentSelection, draftMtdMode, isWorkspacePath]);
+
+  useEffect(() => {
+    if (!isWorkspacePath) {
+      return;
+    }
+    if (restoredForPathRef.current === pathname) {
+      return;
+    }
+    restoredForPathRef.current = pathname;
+
+    const hasExplicitTimeframe = Boolean(searchParams.get("dashboardTimeframe")?.trim());
+    const hasExplicitFinancialYear =
+      Boolean(searchParams.get("financialYear")?.trim()) ||
+      searchParams.getAll("financialYears").some((value) => value.trim().length > 0);
+    const hasPeriodWindow =
+      Boolean(searchParams.get("periodFrom")?.trim()) &&
+      Boolean(searchParams.get("periodTo")?.trim());
+
+    if (hasExplicitTimeframe && hasExplicitFinancialYear && hasPeriodWindow) {
+      return;
+    }
+
+    const nextSelection: DashboardDraftSelection = {
+      financialYear: currentFinancialYear,
+      dashboardTimeframe: "annual",
+      dashboardMonth: resolveCurrentFiscalMonth(),
+      dashboardQuarter: quarterForMonth(resolveCurrentFiscalMonth()),
+    };
+
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete("dashboardDataset");
+    next.delete("financialYears");
+    next.set("financialYear", nextSelection.financialYear);
+    next.set(
+      "dashboardTimeframe",
+      hasExplicitTimeframe ? selectedTimeframe : nextSelection.dashboardTimeframe,
+    );
+    applyPeriodWindow(
+      next,
+      hasExplicitTimeframe ? selectedTimeframe : nextSelection.dashboardTimeframe,
+      nextSelection.dashboardMonth,
+      nextSelection.dashboardQuarter,
+    );
+
+    const query = next.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  }, [
+    currentFinancialYear,
+    isWorkspacePath,
+    pathname,
+    router,
+    searchParams,
+    selectedTimeframe,
+  ]);
+
+  function resetDraftFromCurrentSelection() {
+    const resolvedMtdMode = resolveMtdMode(searchParams.get("dashboardMtdMode"), currentSelection);
+    setDraftSelection(currentSelection);
+    setDraftMtdMode(resolvedMtdMode);
+  }
+
+  function handleOpenChange(nextOpen: boolean) {
+    resetDraftFromCurrentSelection();
+    setOpen(nextOpen);
+  }
+
+  function applyDashboardQuery(selection: DashboardDraftSelection, mtdMode: MtdMode) {
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete("dashboardDataset");
+    next.delete("financialYears");
+    next.delete("dashboardMtdMode");
+    next.set("financialYear", selection.financialYear);
+    next.set("dashboardTimeframe", selection.dashboardTimeframe);
+    if (selection.dashboardTimeframe === "mtd") {
+      next.set("dashboardMtdMode", mtdMode);
+    }
+    applyPeriodWindow(
+      next,
+      selection.dashboardTimeframe,
+      selection.dashboardMonth,
+      selection.dashboardQuarter,
+    );
+    const query = next.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+    handleOpenChange(false);
+  }
+
+  function handleInnerDialChange(nextTimeframe: DashboardTimeframe) {
+    setDraftSelection((current) => {
+      if (nextTimeframe === "mtd") {
+        setDraftMtdMode(resolveMtdModeForMonth(current.dashboardMonth));
+      }
+      if (nextTimeframe === "quarter") {
+        return {
+          ...current,
+          dashboardTimeframe: "quarter",
+          dashboardQuarter: current.dashboardQuarter,
+          dashboardMonth: QUARTER_MONTH_MAP[current.dashboardQuarter][2],
+        };
+      }
+      if (nextTimeframe === "annual") {
+        return { ...current, dashboardTimeframe: "annual" };
+      }
+      if (nextTimeframe === "ytd") {
+        return { ...current, dashboardTimeframe: "ytd" };
+      }
+      return { ...current, dashboardTimeframe: "mtd" };
+    });
+  }
+
+  function handleOuterDialChange(nextSelection: Exclude<OuterDialSelection, "none">) {
+    setDraftSelection((current) => {
+      if (current.dashboardTimeframe === "quarter") {
+        const nextQuarter = nextSelection as DashboardQuarter;
+        return {
+          ...current,
+          dashboardQuarter: nextQuarter,
+          dashboardMonth: QUARTER_MONTH_MAP[nextQuarter][2],
+        };
+      }
+      const nextMonth = nextSelection as FiscalMonth;
+      if (current.dashboardTimeframe === "mtd") {
+        setDraftMtdMode(resolveMtdModeForMonth(nextMonth));
+      }
+      return {
+        ...current,
+        dashboardMonth: nextMonth,
+        dashboardQuarter: quarterForMonth(nextMonth),
+      };
+    });
+  }
+
+  const outerSelection = resolveOuterSelection(draftSelection);
+  const summary = [selectedFinancialYear, formatTimeframeSummary(currentSelection)].join(" | ");
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className={`inline-flex shrink-0 items-center gap-2 rounded-[28px] border border-slate-950 bg-white/94 px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.14em] text-slate-950 shadow-[0_18px_38px_rgba(15,23,42,0.12)] backdrop-blur-2xl transition hover:-translate-y-0.5 hover:border-slate-800 ${
+            open ? "border-slate-950" : ""
+          }`}
+          aria-label={`Open workspace data controls for ${summary}`}
+        >
+          <ChartColumnIncreasing className="h-4 w-4" />
+          <span className="max-w-[16rem] truncate text-[11px] font-semibold normal-case tracking-normal text-slate-700 sm:max-w-[20rem]">
+            {summary}
+          </span>
+          <ChevronDown className={`h-4 w-4 transition-transform ${open ? "rotate-180" : ""}`} />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        side="bottom"
+        sideOffset={12}
+        className="w-[min(92vw,28rem)] rounded-[28px] border border-white/80 bg-white/92 p-0 shadow-[0_24px_60px_rgba(15,23,42,0.18)] backdrop-blur-2xl"
+      >
+        <div className="flex max-h-[82vh] flex-col overflow-hidden">
+          <div className="border-b border-slate-200 px-4 py-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-950">Workspace data controls</p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Inner ring sets timeframe. Outer ring sets month or quarter.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleOpenChange(false)}
+                className="rounded-full border border-slate-200 bg-white p-2 text-slate-500 hover:border-slate-300 hover:text-slate-900"
+                aria-label="Close workspace data controls"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-5 overflow-y-auto px-4 py-4">
+            <label className="grid gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+              Financial Year
+              <select
+                value={draftSelection.financialYear}
+                onChange={(event) =>
+                  setDraftSelection((current) => ({
+                    ...current,
+                    financialYear: event.target.value,
+                  }))
+                }
+                className="h-11 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-semibold normal-case tracking-normal text-slate-800 outline-none"
+              >
+                {financialYearOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <RotatingWorkspaceDial
+              timeframe={draftSelection.dashboardTimeframe}
+              outerSelection={outerSelection}
+              onTimeframeChange={handleInnerDialChange}
+              onOuterSelectionChange={handleOuterDialChange}
+            />
+
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                Current Dial Selection
+              </p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">
+                {draftSelection.dashboardTimeframe === "annual"
+                  ? "Annual"
+                  : draftSelection.dashboardTimeframe === "quarter"
+                    ? `Quarters - ${draftSelection.dashboardQuarter}`
+                    : `${draftSelection.dashboardTimeframe.toUpperCase()} - ${draftSelection.dashboardMonth}`}
+              </p>
+              <p className="mt-1 text-xs text-slate-600">
+                {draftSelection.dashboardTimeframe === "annual"
+                  ? "Outer ring is disabled in Annual mode."
+                  : draftSelection.dashboardTimeframe === "quarter"
+                    ? "Outer ring selects Q1 to Q4."
+                    : draftSelection.dashboardTimeframe === "ytd"
+                      ? "Outer ring month sets Apr through selected month."
+                      : "Outer ring month sets periodFrom and periodTo to the same month."}
+              </p>
+            </div>
+          </div>
+
+          <div className="border-t border-slate-200 bg-white px-4 py-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-xs text-slate-500">
+                Applied filters update dashboards, kiosk, and trends.
+              </p>
+              <div className="flex w-full gap-3 sm:w-auto">
+                <button
+                  type="button"
+                  onClick={() => setOpen(false)}
+                  className="flex-1 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:border-slate-300 hover:text-slate-950 sm:flex-none"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => applyDashboardQuery(draftSelection, draftMtdMode)}
+                  className="inline-flex flex-1 items-center justify-center gap-2 rounded-full border border-slate-950 bg-slate-950 px-5 py-2 text-sm font-semibold text-white hover:bg-slate-900 sm:flex-none"
+                >
+                  <CheckCheck className="h-4 w-4" />
+                  Submit
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
