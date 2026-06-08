@@ -48,7 +48,7 @@ The script:
 ## Seeded superuser
 
 - Email: `nitesh.r@mindteck.us`
-- Password: `M!ndteck$1`
+- Password: you are my baby
 
 On first login, the app will ask you to enroll Microsoft Authenticator using
 the QR code shown on `/login/totp`. Users created by admin receive a temporary
